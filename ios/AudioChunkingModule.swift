@@ -12,6 +12,7 @@ class AudioChunkingModule: RCTEventEmitter {
     private var recordingStartTime: TimeInterval = 0
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
+    private var isCreatingChunk = false // Flag to prevent multiple chunk creations
     
     override init() {
         super.init()
@@ -68,6 +69,7 @@ class AudioChunkingModule: RCTEventEmitter {
             isRecording = true
             recordingStartTime = CACurrentMediaTime()
             audioBuffer.removeAll()
+            isCreatingChunk = false
             
             resolver("Recording started successfully")
         } catch {
@@ -76,7 +78,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        guard isRecording else { return }
+        guard isRecording && !isCreatingChunk else { return }
         
         // Convert buffer to Data
         let frameLength = Int(buffer.frameLength)
@@ -98,8 +100,10 @@ class AudioChunkingModule: RCTEventEmitter {
         let elapsedTime = (currentTime - recordingStartTime) * 1000 // Convert to milliseconds
         
         if elapsedTime >= Double(chunkDurationMs) {
+            isCreatingChunk = true
             createAndSendChunk()
             recordingStartTime = currentTime // Reset for next chunk
+            isCreatingChunk = false
         }
     }
     
