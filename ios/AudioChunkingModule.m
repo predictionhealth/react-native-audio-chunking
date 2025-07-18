@@ -10,4 +10,9 @@ RCT_EXTERN_METHOD(startChunkedRecording:(NSInteger)chunkDuration
 RCT_EXTERN_METHOD(stopRecording:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
++ (BOOL)requiresMainQueueSetup
+{
+  return NO;
+}
+
 @end

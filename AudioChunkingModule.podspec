@@ -8,7 +8,7 @@ Pod::Spec.new do |s|
     s.author       = { "Isaac Grey" => "isaac.j.grey@gmail.com" }
     s.platform     = :ios, "11.0"
     s.source       = { :git => "https://github.com/isaacg11/react-native-audio-chunking.git", :tag => "#{s.version}" }
-    s.source_files  = "*.{m,swift}"
+    s.source_files  = "ios/*.{m,swift}"
     s.requires_arc = true
     s.dependency "React-Core"
   end

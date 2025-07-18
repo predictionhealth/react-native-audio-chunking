@@ -22,6 +22,11 @@ class AudioChunkingModule: RCTEventEmitter {
         return ["onChunkReady"]
     }
     
+    @objc
+    static func requiresMainQueueSetup() -> Bool {
+        return false
+    }
+    
     private func setupAudioSession() {
         do {
             let audioSession = AVAudioSession.sharedInstance()
