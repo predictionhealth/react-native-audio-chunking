@@ -38,12 +38,22 @@ class AudioChunkingModule: RCTEventEmitter {
         }
     }
     
+    private func resetModuleState() {
+        isRecording = false
+        isCreatingChunk = false
+        audioBuffer.removeAll()
+        recordingStartTime = 0
+    }
+    
     @objc
     func startChunkedRecording(_ chunkDuration: Int, resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
         if isRecording {
             rejecter("ALREADY_RECORDING", "Recording is already in progress", nil)
             return
         }
+        
+        // Reset state before starting new recording
+        resetModuleState()
         
         self.chunkDurationMs = chunkDuration
         
@@ -73,6 +83,8 @@ class AudioChunkingModule: RCTEventEmitter {
             
             resolver("Recording started successfully")
         } catch {
+            // Reset flags on error
+            resetModuleState()
             rejecter("START_FAILED", "Failed to start recording: \(error.localizedDescription)", error)
         }
     }
@@ -131,17 +143,18 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
         
-        isRecording = false
+        // Send final chunk if there's remaining data
+        if !audioBuffer.isEmpty {
+            createAndSendChunk()
+        }
         
         inputNode?.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
         inputNode = nil
         
-        // Send final chunk if there's remaining data
-        if !audioBuffer.isEmpty {
-            createAndSendChunk()
-        }
+        // Reset all state
+        resetModuleState()
         
         resolver("Recording stopped successfully")
     }
