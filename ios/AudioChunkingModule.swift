@@ -13,6 +13,7 @@ class AudioChunkingModule: RCTEventEmitter {
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
     private var isCreatingChunk = false // Flag to prevent multiple chunk creations
+    private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
     
     override init() {
         super.init()
@@ -70,7 +71,9 @@ class AudioChunkingModule: RCTEventEmitter {
             sampleRate = recordingFormat.sampleRate
             
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                self?.processAudioBuffer(buffer)
+                self?.processingQueue.async {
+                    self?.processAudioBuffer(buffer)
+                }
             }
             
             audioEngine?.prepare()
@@ -143,19 +146,31 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
         
-        // Send final chunk if there's remaining data
-        if !audioBuffer.isEmpty {
-            createAndSendChunk()
-        }
+        // Stop recording immediately to prevent new audio processing
+        isRecording = false
+        isCreatingChunk = false
         
+        // Remove tap and stop engine
         inputNode?.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
         inputNode = nil
         
-        // Reset all state
-        resetModuleState()
-        
-        resolver("Recording stopped successfully")
+        // Wait for any pending processing to complete, then send final chunk
+        processingQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Send final chunk if there's remaining data
+            if !self.audioBuffer.isEmpty {
+                self.createAndSendChunk()
+            }
+            
+            // Reset all state
+            self.resetModuleState()
+            
+            DispatchQueue.main.async {
+                resolver("Recording stopped successfully")
+            }
+        }
     }
 }
