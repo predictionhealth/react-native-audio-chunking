@@ -12,9 +12,8 @@ class AudioChunkingModule: RCTEventEmitter {
     private var recordingStartTime: TimeInterval = 0
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
-    private var isCreatingChunk = false // Flag to prevent multiple chunk creations
+    private var chunkCounter = 0
     private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
-    private let stateQueue = DispatchQueue(label: "audio.state", qos: .userInitiated)
     
     override init() {
         super.init()
@@ -41,12 +40,10 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     private func resetModuleState() {
-        stateQueue.sync {
-            isRecording = false
-            isCreatingChunk = false
-            audioBuffer.removeAll()
-            recordingStartTime = 0
-        }
+        isRecording = false
+        audioBuffer.removeAll()
+        recordingStartTime = 0
+        chunkCounter = 0
     }
     
     @objc
@@ -82,12 +79,10 @@ class AudioChunkingModule: RCTEventEmitter {
             audioEngine?.prepare()
             try audioEngine?.start()
             
-            stateQueue.sync {
-                isRecording = true
-                recordingStartTime = CACurrentMediaTime()
-                audioBuffer.removeAll()
-                isCreatingChunk = false
-            }
+            isRecording = true
+            recordingStartTime = CACurrentMediaTime()
+            audioBuffer.removeAll()
+            chunkCounter = 0
             
             resolver("Recording started successfully")
         } catch {
@@ -98,19 +93,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        // Check state atomically
-        var shouldProcess = false
-        var shouldCreateChunk = false
-        var currentRecordingStartTime: TimeInterval = 0
-        
-        stateQueue.sync {
-            shouldProcess = isRecording && !isCreatingChunk
-            if shouldProcess {
-                currentRecordingStartTime = recordingStartTime
-            }
-        }
-        
-        guard shouldProcess else { return }
+        guard isRecording else { return }
         
         // Convert buffer to Data
         let frameLength = Int(buffer.frameLength)
@@ -125,58 +108,40 @@ class AudioChunkingModule: RCTEventEmitter {
             }
         }
         
-        // Add to buffer atomically
-        stateQueue.sync {
-            if isRecording && !isCreatingChunk {
-                audioBuffer.append(audioData)
-            }
-        }
+        audioBuffer.append(audioData)
         
         // Check if it's time to create a chunk
         let currentTime = CACurrentMediaTime()
-        let elapsedTime = (currentTime - currentRecordingStartTime) * 1000 // Convert to milliseconds
+        let elapsedTime = (currentTime - recordingStartTime) * 1000 // Convert to milliseconds
         
         if elapsedTime >= Double(chunkDurationMs) {
-            // Try to acquire chunk creation lock
-            var acquired = false
-            stateQueue.sync {
-                if isRecording && !isCreatingChunk {
-                    isCreatingChunk = true
-                    acquired = true
-                }
-            }
+            let expectedChunkNumber = Int(elapsedTime / Double(chunkDurationMs))
             
-            if acquired {
+            // Only create chunk if we haven't created this chunk number yet
+            if expectedChunkNumber > chunkCounter {
+                chunkCounter = expectedChunkNumber
                 createAndSendChunk()
-                stateQueue.sync {
-                    recordingStartTime = currentTime // Reset for next chunk
-                    isCreatingChunk = false
-                }
+                recordingStartTime = currentTime // Reset for next chunk
             }
         }
     }
     
     private func createAndSendChunk() {
-        var chunkAudioData: Data?
-        
-        stateQueue.sync {
-            chunkAudioData = audioBuffer
-            audioBuffer.removeAll()
-        }
-        
-        guard let audioData = chunkAudioData else { return }
-        
-        let base64Audio = audioData.base64EncodedString()
+        let base64Audio = audioBuffer.base64EncodedString()
         
         let chunkData: [String: Any] = [
             "audioData": base64Audio,
             "format": "pcm",
             "sampleRate": Int(sampleRate),
             "channels": 1,
-            "bitsPerSample": 16
+            "bitsPerSample": 16,
+            "chunkNumber": chunkCounter
         ]
         
         sendEvent(withName: "onChunkReady", body: chunkData)
+        
+        // Clear buffer for next chunk
+        audioBuffer.removeAll()
     }
     
     @objc
@@ -186,11 +151,8 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
         
-        // Stop recording immediately to prevent new audio processing
-        stateQueue.sync {
-            isRecording = false
-            isCreatingChunk = false
-        }
+        // Stop recording immediately
+        isRecording = false
         
         // Remove tap and stop engine
         inputNode?.removeTap(onBus: 0)
@@ -203,22 +165,8 @@ class AudioChunkingModule: RCTEventEmitter {
             guard let self = self else { return }
             
             // Send final chunk if there's remaining data
-            var finalChunkData: Data?
-            self.stateQueue.sync {
-                finalChunkData = self.audioBuffer
-                self.audioBuffer.removeAll()
-            }
-            
-            if let finalData = finalChunkData, !finalData.isEmpty {
-                let base64Audio = finalData.base64EncodedString()
-                let chunkData: [String: Any] = [
-                    "audioData": base64Audio,
-                    "format": "pcm",
-                    "sampleRate": Int(self.sampleRate),
-                    "channels": 1,
-                    "bitsPerSample": 16
-                ]
-                self.sendEvent(withName: "onChunkReady", body: chunkData)
+            if !self.audioBuffer.isEmpty {
+                self.createAndSendChunk()
             }
             
             // Reset all state
