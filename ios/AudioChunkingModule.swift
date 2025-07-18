@@ -23,7 +23,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     @objc
-    static func requiresMainQueueSetup() -> Bool {
+    override static func requiresMainQueueSetup() -> Bool {
         return false
     }
     
