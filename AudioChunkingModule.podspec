@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
     s.name         = "AudioChunkingModule"
-    s.version      = "1.0.6"
+    s.version      = "1.0.7"
     s.summary      = "Audio chunking native module for React Native"
     s.description  = "A React Native module for chunked audio recording."
     s.homepage     = "https://github.com/isaacg11/react-native-audio-chunking"
