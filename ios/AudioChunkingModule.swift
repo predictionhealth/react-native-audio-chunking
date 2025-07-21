@@ -48,24 +48,23 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
 
-        // Clean up previous session
+        // Cleanup any previous session: timer + engine
         stopAndCleanupEngine()
         resetModuleState()
 
-        // Configure chunk duration and state
+        // Configure
         chunkDurationMs = chunkDuration
         isRecording = true
 
-        // Initialize a new audio engine
+        // Initialize new engine and tap
         let engine = AVAudioEngine()
         audioEngine = engine
         let input = engine.inputNode
-        let recordingFormat = input.outputFormat(forBus: 0)
-        sampleRate = recordingFormat.sampleRate
+        let format = input.outputFormat(forBus: 0)
+        sampleRate = format.sampleRate
 
-        // Install tap directly on the input node
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.processingQueue.async {
                 self?.appendBufferData(buffer)
             }
@@ -84,7 +83,7 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
 
-        // Start repeating timer for chunk intervals
+        // Schedule repeating chunk timer
         let timer = DispatchSource.makeTimerSource(queue: processingQueue)
         timer.schedule(deadline: .now() + .milliseconds(chunkDurationMs), repeating: .milliseconds(chunkDurationMs))
         timer.setEventHandler { [weak self] in
@@ -97,11 +96,11 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func appendBufferData(_ buffer: AVAudioPCMBuffer) {
-        let frameLength = Int(buffer.frameLength)
-        guard let channelData = buffer.floatChannelData?[0] else { return }
+        let frameLen = Int(buffer.frameLength)
+        guard let channel = buffer.floatChannelData?[0] else { return }
         var data = Data()
-        for i in 0..<frameLength {
-            let sample = channelData[i]
+        for i in 0..<frameLen {
+            let sample = channel[i]
             let int16 = Int16(sample * Float(Int16.max))
             withUnsafeBytes(of: int16.littleEndian) { data.append(contentsOf: $0) }
         }
@@ -131,14 +130,7 @@ class AudioChunkingModule: RCTEventEmitter {
 
         isRecording = false
 
-        // Cancel timer
-        if let timer = chunkTimer {
-            timer.cancel()
-            chunkTimer = nil
-            print("✅ Canceled timer")
-        }
-
-        // Stop engine and remove tap
+        // Engine + timer cleanup will handle both
         stopAndCleanupEngine()
 
         // Flush any remaining data
@@ -153,11 +145,18 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func stopAndCleanupEngine() {
+        // Cancel any existing timer to prevent duplicate events
+        if let timer = chunkTimer {
+            timer.cancel()
+            chunkTimer = nil
+            print("✅ Canceled previous chunk timer")
+        }
+        // Stop and reset engine (removes taps)
         if let engine = audioEngine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
             engine.reset()
-            print("✅ Stopped and reset engine")
+            print("✅ Stopped and reset AVAudioEngine")
         }
         audioEngine = nil
     }
