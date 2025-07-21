@@ -5,9 +5,8 @@ import React
 @objc(AudioChunkingModule)
 class AudioChunkingModule: RCTEventEmitter {
     private var audioEngine: AVAudioEngine?
-    private var inputNode: AVAudioInputNode?
     private var isRecording = false
-    private var chunkDurationMs: Int = 120000 // default 120 seconds
+    private var chunkDurationMs: Int = 120000 // default to 120 seconds
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
     private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
@@ -38,125 +37,114 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func resetModuleState() {
-        isRecording = false
         audioBuffer.removeAll()
         sampleRate = 22050
     }
 
     @objc
     func startChunkedRecording(_ chunkDuration: Int, resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
-        if isRecording {
-            rejecter("ALREADY_RECORDING", "Recording is already in progress", nil)
+        guard !isRecording else {
+            rejecter("ALREADY_RECORDING", "Recording already in progress", nil)
             return
         }
 
-        // Stop any existing session (cancels timer & engine)
+        // Clean up any previous session
         stopAndCleanupEngine()
         resetModuleState()
 
+        // Set chunk duration and mark recording
         chunkDurationMs = chunkDuration
+        isRecording = true
 
-        // Initialize a new audio engine
+        // Create a fresh engine
         let engine = AVAudioEngine()
         audioEngine = engine
-        let node = engine.inputNode
-        let recordingFormat = node.outputFormat(forBus: 0)
-        sampleRate = recordingFormat.sampleRate
 
-        // Install tap for raw audio
-        node.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+        // Install tap on main mixer to avoid stacking taps on inputNode
+        let mixer = engine.mainMixerNode
+        let format = mixer.outputFormat(forBus: 0)
+        mixer.removeTap(onBus: 0) // defensive
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.processingQueue.async {
                 self?.appendBufferData(buffer)
             }
         }
-        print("✅ [AudioChunkingModule] Installed tap for new recording")
+        print("✅ [AudioChunkingModule] Installed tap on main mixer")
 
-        engine.prepare()
         do {
+            engine.prepare()
             try engine.start()
             print("✅ [AudioChunkingModule] Started AVAudioEngine")
         } catch {
             stopAndCleanupEngine()
-            resetModuleState()
+            isRecording = false
             rejecter("START_FAILED", "Failed to start recording: \(error.localizedDescription)", error)
             return
         }
 
-        // Schedule first chunk timer
+        // Start a repeating timer for chunk intervals
         let timer = DispatchSource.makeTimerSource(queue: processingQueue)
-        timer.schedule(deadline: .now() + .milliseconds(chunkDurationMs))
+        timer.schedule(deadline: .now() + .milliseconds(chunkDurationMs), repeating: .milliseconds(chunkDurationMs))
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isRecording else { return }
             self.createAndSendChunk()
-            // schedule next
-            self.scheduleNextTimer()
         }
         timer.resume()
         chunkTimer = timer
 
-        inputNode = node
-        isRecording = true
-
         resolver("Recording started successfully")
-    }
-
-    private func scheduleNextTimer() {
-        // Cancel existing timer if any
-        chunkTimer?.cancel()
-        let next = DispatchSource.makeTimerSource(queue: processingQueue)
-        next.schedule(deadline: .now() + .milliseconds(chunkDurationMs))
-        next.setEventHandler { [weak self] in
-            guard let self = self, self.isRecording else { return }
-            self.createAndSendChunk()
-            self.scheduleNextTimer()
-        }
-        next.resume()
-        chunkTimer = next
     }
 
     private func appendBufferData(_ buffer: AVAudioPCMBuffer) {
         let frameLength = Int(buffer.frameLength)
         guard let channelData = buffer.floatChannelData?[0] else { return }
-        var audioData = Data()
+        var data = Data()
         for i in 0..<frameLength {
             let sample = channelData[i]
             let int16Sample = Int16(sample * Float(Int16.max))
             withUnsafeBytes(of: int16Sample.littleEndian) { bytes in
-                audioData.append(contentsOf: bytes)
+                data.append(contentsOf: bytes)
             }
         }
-        audioBuffer.append(audioData)
+        audioBuffer.append(data)
     }
 
     private func createAndSendChunk() {
         guard !audioBuffer.isEmpty else { return }
-        let base64Audio = audioBuffer.base64EncodedString()
-        let chunkData: [String: Any] = [
-            "audioData": base64Audio,
+        let base64 = audioBuffer.base64EncodedString()
+        let chunk: [String: Any] = [
+            "audioData": base64,
             "format": "pcm",
             "sampleRate": Int(sampleRate),
             "channels": 1,
             "bitsPerSample": 16
         ]
         DispatchQueue.main.async {
-            self.sendEvent(withName: "onChunkReady", body: chunkData)
+            self.sendEvent(withName: "onChunkReady", body: chunk)
         }
         audioBuffer.removeAll()
     }
 
     @objc
     func stopRecording(_ resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
-        if !isRecording {
+        guard isRecording else {
             rejecter("NOT_RECORDING", "No recording in progress", nil)
             return
         }
 
         isRecording = false
 
-        // Stop session
+        // Cancel timer
+        if let timer = chunkTimer {
+            timer.cancel()
+            chunkTimer = nil
+            print("✅ [AudioChunkingModule] Canceled chunk timer")
+        }
+
+        // Stop engine and remove tap
         stopAndCleanupEngine()
 
-        // Flush any remaining audio
+        // Flush remaining data
         processingQueue.async { [weak self] in
             guard let self = self else { return }
             if !self.audioBuffer.isEmpty {
@@ -170,20 +158,12 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func stopAndCleanupEngine() {
-        // Cancel timer and clear
-        if let timer = chunkTimer {
-            timer.cancel()
-            chunkTimer = nil
-            print("✅ [AudioChunkingModule] Canceled chunk timer")
-        }
-        // Stop and reset engine
         if let engine = audioEngine {
-            inputNode?.removeTap(onBus: 0)
+            engine.mainMixerNode.removeTap(onBus: 0)
             engine.stop()
             engine.reset()
             print("✅ [AudioChunkingModule] Stopped and reset AVAudioEngine")
         }
-        inputNode = nil
         audioEngine = nil
     }
 }
