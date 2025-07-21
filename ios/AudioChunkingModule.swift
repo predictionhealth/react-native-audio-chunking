@@ -9,10 +9,9 @@ class AudioChunkingModule: RCTEventEmitter {
     private var inputNode: AVAudioInputNode?
     private var isRecording = false
     private var chunkDurationMs: Int = 120000 // 120 seconds default
-    private var recordingStartTime: TimeInterval = 0
+    private var lastChunkTime: TimeInterval = 0
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
-    private var chunkCounter = 0
     private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
     
     override init() {
@@ -42,8 +41,7 @@ class AudioChunkingModule: RCTEventEmitter {
     private func resetModuleState() {
         isRecording = false
         audioBuffer.removeAll()
-        recordingStartTime = 0
-        chunkCounter = 0
+        lastChunkTime = 0
     }
     
     @objc
@@ -80,9 +78,8 @@ class AudioChunkingModule: RCTEventEmitter {
             try audioEngine?.start()
             
             isRecording = true
-            recordingStartTime = CACurrentMediaTime()
+            lastChunkTime = CACurrentMediaTime()
             audioBuffer.removeAll()
-            chunkCounter = 0
             
             resolver("Recording started successfully")
         } catch {
@@ -112,17 +109,11 @@ class AudioChunkingModule: RCTEventEmitter {
         
         // Check if it's time to create a chunk
         let currentTime = CACurrentMediaTime()
-        let elapsedTime = (currentTime - recordingStartTime) * 1000 // Convert to milliseconds
+        let elapsedSinceLastChunk = (currentTime - lastChunkTime) * 1000 // ms
         
-        if elapsedTime >= Double(chunkDurationMs) {
-            let expectedChunkNumber = Int(elapsedTime / Double(chunkDurationMs))
-            
-            // Only create chunk if we haven't created this chunk number yet
-            if expectedChunkNumber > chunkCounter {
-                chunkCounter = expectedChunkNumber
-                createAndSendChunk()
-                recordingStartTime = currentTime // Reset for next chunk
-            }
+        if elapsedSinceLastChunk >= Double(chunkDurationMs) {
+            createAndSendChunk()
+            lastChunkTime = currentTime
         }
     }
     
@@ -134,8 +125,7 @@ class AudioChunkingModule: RCTEventEmitter {
             "format": "pcm",
             "sampleRate": Int(sampleRate),
             "channels": 1,
-            "bitsPerSample": 16,
-            "chunkNumber": chunkCounter
+            "bitsPerSample": 16
         ]
         
         sendEvent(withName: "onChunkReady", body: chunkData)
