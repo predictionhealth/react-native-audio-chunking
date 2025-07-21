@@ -68,6 +68,8 @@ class AudioChunkingModule: RCTEventEmitter {
             let recordingFormat = inputNode.outputFormat(forBus: 0)
             sampleRate = recordingFormat.sampleRate
             
+            // REMOVE ANY EXISTING TAP BEFORE ADDING A NEW ONE!
+            inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
                 self?.processingQueue.async {
                     self?.processAudioBuffer(buffer)
