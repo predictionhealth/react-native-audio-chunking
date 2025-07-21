@@ -63,10 +63,12 @@ class AudioChunkingModule: RCTEventEmitter {
         let format = input.outputFormat(forBus: 0)
         sampleRate = format.sampleRate
 
+        // Ensure no existing tap is present
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.processingQueue.async {
-                self?.appendBufferData(buffer)
+            guard let self = self, self.isRecording else { return }
+            self.processingQueue.async {
+                self.appendBufferData(buffer)
             }
         }
         print("✅ Installed tap on inputNode")
@@ -83,19 +85,29 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
 
+        // Ensure no existing timer is active
+        if chunkTimer != nil {
+            chunkTimer?.cancel()
+            chunkTimer = nil
+            print("✅ Canceled stale chunk timer before starting new one")
+        }
+
         // Schedule repeating chunk timer
         let timer = DispatchSource.makeTimerSource(queue: processingQueue)
         timer.schedule(deadline: .now() + .milliseconds(chunkDurationMs), repeating: .milliseconds(chunkDurationMs))
         timer.setEventHandler { [weak self] in
-            self?.createAndSendChunk()
+            guard let self = self, self.isRecording else { return }
+            self.createAndSendChunk()
         }
         timer.resume()
         chunkTimer = timer
+        print("✅ Started new chunk timer")
 
         resolver("Recording started successfully")
     }
 
     private func appendBufferData(_ buffer: AVAudioPCMBuffer) {
+        guard isRecording else { return }
         let frameLen = Int(buffer.frameLength)
         guard let channel = buffer.floatChannelData?[0] else { return }
         var data = Data()
@@ -108,7 +120,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func createAndSendChunk() {
-        guard !audioBuffer.isEmpty else { return }
+        guard !audioBuffer.isEmpty, isRecording else { return }
         let b64 = audioBuffer.base64EncodedString()
         let chunk: [String: Any] = [
             "audioData": b64,
@@ -117,7 +129,10 @@ class AudioChunkingModule: RCTEventEmitter {
             "channels": 1,
             "bitsPerSample": 16
         ]
-        DispatchQueue.main.async { self.sendEvent(withName: "onChunkReady", body: chunk) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isRecording else { return }
+            self.sendEvent(withName: "onChunkReady", body: chunk)
+        }
         audioBuffer.removeAll()
     }
 
@@ -130,7 +145,7 @@ class AudioChunkingModule: RCTEventEmitter {
 
         isRecording = false
 
-        // Engine + timer cleanup will handle both
+        // Engine + timer cleanup
         stopAndCleanupEngine()
 
         // Flush any remaining data
@@ -145,13 +160,13 @@ class AudioChunkingModule: RCTEventEmitter {
     }
 
     private func stopAndCleanupEngine() {
-        // Cancel any existing timer to prevent duplicate events
+        // Cancel timer to prevent duplicate events
         if let timer = chunkTimer {
             timer.cancel()
             chunkTimer = nil
-            print("✅ Canceled previous chunk timer")
+            print("✅ Canceled chunk timer")
         }
-        // Stop and reset engine (removes taps)
+        // Stop and reset engine
         if let engine = audioEngine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
