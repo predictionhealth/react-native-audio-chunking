@@ -6,7 +6,7 @@ import React
 class AudioChunkingModule: RCTEventEmitter {
     private var audioEngine: AVAudioEngine?
     private var isRecording = false
-    private var chunkDurationMs: Int = 120000 // default 120 seconds
+    private var chunkDurationMs: Int = 120000 // default to 120 seconds
     private var audioBuffer = Data()
     private var sampleRate: Double = 22050
     private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
@@ -48,24 +48,22 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
 
-        // Cleanup previous session
+        // Clean up previous session
         stopAndCleanupEngine()
         resetModuleState()
 
+        // Configure chunk duration and state
         chunkDurationMs = chunkDuration
         isRecording = true
 
-        // Setup new engine
+        // Initialize a new audio engine
         let engine = AVAudioEngine()
         audioEngine = engine
-
         let input = engine.inputNode
         let recordingFormat = input.outputFormat(forBus: 0)
+        sampleRate = recordingFormat.sampleRate
 
-        // Explicitly connect inputNode to mainMixerNode
-        engine.connect(input, to: engine.mainMixerNode, format: recordingFormat)
-
-        // Install tap on inputNode
+        // Install tap directly on the input node
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             self?.processingQueue.async {
@@ -81,6 +79,7 @@ class AudioChunkingModule: RCTEventEmitter {
         } catch {
             stopAndCleanupEngine()
             isRecording = false
+            resetModuleState()
             rejecter("START_FAILED", "Failed to start engine: \(error.localizedDescription)", error)
             return
         }
