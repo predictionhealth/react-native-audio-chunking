@@ -5,7 +5,7 @@ import React
 @objc(AudioChunkingModule)
 class AudioChunkingModule: RCTEventEmitter {
     
-    private var audioEngine: AVAudioEngine?
+    private let audioEngine = AVAudioEngine()
     private var inputNode: AVAudioInputNode?
     private var isRecording = false
     private var chunkDurationMs: Int = 120000 // 120 seconds default
@@ -43,7 +43,6 @@ class AudioChunkingModule: RCTEventEmitter {
         audioBuffer.removeAll()
         lastChunkTime = 0
         inputNode = nil
-        audioEngine = nil
     }
     
     @objc
@@ -53,37 +52,39 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
         
+        // Defensive: Always stop and remove tap before starting
+        stopAndCleanupEngine()
+        
         // Reset state before starting new recording
         resetModuleState()
         
         self.chunkDurationMs = chunkDuration
         
         do {
-            // Always create a new engine and inputNode
-            let engine = AVAudioEngine()
-            let node = engine.inputNode
-            
+            let node = audioEngine.inputNode
             let recordingFormat = node.outputFormat(forBus: 0)
             sampleRate = recordingFormat.sampleRate
             
             // Remove any existing tap (shouldn't be needed, but for safety)
             node.removeTap(onBus: 0)
+            print("✅ [AudioChunkingModule] Removed tap before starting new recording")
+            
             node.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
                 self?.processingQueue.async {
                     self?.processAudioBuffer(buffer)
                 }
             }
+            print("✅ [AudioChunkingModule] Installed tap for new recording")
             
-            engine.prepare()
-            try engine.start()
+            audioEngine.prepare()
+            try audioEngine.start()
+            print("✅ [AudioChunkingModule] Started AVAudioEngine")
             
-            self.audioEngine = engine
             self.inputNode = node
             isRecording = true
             lastChunkTime = CACurrentMediaTime()
             audioBuffer.removeAll()
             
-            print("✅ [AudioChunkingModule] Started new AVAudioEngine and installed tap")
             resolver("Recording started successfully")
         } catch {
             // Reset flags on error
@@ -147,16 +148,7 @@ class AudioChunkingModule: RCTEventEmitter {
         isRecording = false
         
         // Remove tap and stop engine
-        if let node = inputNode {
-            node.removeTap(onBus: 0)
-            print("✅ [AudioChunkingModule] Removed tap from inputNode")
-        }
-        if let engine = audioEngine {
-            engine.stop()
-            print("✅ [AudioChunkingModule] Stopped AVAudioEngine")
-        }
-        inputNode = nil
-        audioEngine = nil
+        stopAndCleanupEngine()
         
         // Wait for any pending processing to complete, then send final chunk
         processingQueue.async { [weak self] in
@@ -174,5 +166,17 @@ class AudioChunkingModule: RCTEventEmitter {
                 resolver("Recording stopped successfully")
             }
         }
+    }
+    
+    private func stopAndCleanupEngine() {
+        if let node = inputNode {
+            node.removeTap(onBus: 0)
+            print("✅ [AudioChunkingModule] Removed tap from inputNode (stopAndCleanupEngine)")
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        print("✅ [AudioChunkingModule] Removed tap from audioEngine.inputNode (stopAndCleanupEngine)")
+        audioEngine.stop()
+        print("✅ [AudioChunkingModule] Stopped AVAudioEngine (stopAndCleanupEngine)")
+        inputNode = nil
     }
 }
