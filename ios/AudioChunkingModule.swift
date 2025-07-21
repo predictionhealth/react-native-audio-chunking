@@ -42,6 +42,8 @@ class AudioChunkingModule: RCTEventEmitter {
         isRecording = false
         audioBuffer.removeAll()
         lastChunkTime = 0
+        inputNode = nil
+        audioEngine = nil
     }
     
     @objc
@@ -57,32 +59,31 @@ class AudioChunkingModule: RCTEventEmitter {
         self.chunkDurationMs = chunkDuration
         
         do {
-            audioEngine = AVAudioEngine()
-            inputNode = audioEngine?.inputNode
+            // Always create a new engine and inputNode
+            let engine = AVAudioEngine()
+            let node = engine.inputNode
             
-            guard let inputNode = inputNode else {
-                rejecter("INIT_FAILED", "Failed to get input node", nil)
-                return
-            }
-            
-            let recordingFormat = inputNode.outputFormat(forBus: 0)
+            let recordingFormat = node.outputFormat(forBus: 0)
             sampleRate = recordingFormat.sampleRate
             
-            // REMOVE ANY EXISTING TAP BEFORE ADDING A NEW ONE!
-            inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            // Remove any existing tap (shouldn't be needed, but for safety)
+            node.removeTap(onBus: 0)
+            node.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
                 self?.processingQueue.async {
                     self?.processAudioBuffer(buffer)
                 }
             }
             
-            audioEngine?.prepare()
-            try audioEngine?.start()
+            engine.prepare()
+            try engine.start()
             
+            self.audioEngine = engine
+            self.inputNode = node
             isRecording = true
             lastChunkTime = CACurrentMediaTime()
             audioBuffer.removeAll()
             
+            print("✅ [AudioChunkingModule] Started new AVAudioEngine and installed tap")
             resolver("Recording started successfully")
         } catch {
             // Reset flags on error
@@ -143,14 +144,19 @@ class AudioChunkingModule: RCTEventEmitter {
             return
         }
         
-        // Stop recording immediately
         isRecording = false
         
         // Remove tap and stop engine
-        inputNode?.removeTap(onBus: 0)
-        audioEngine?.stop()
-        audioEngine = nil
+        if let node = inputNode {
+            node.removeTap(onBus: 0)
+            print("✅ [AudioChunkingModule] Removed tap from inputNode")
+        }
+        if let engine = audioEngine {
+            engine.stop()
+            print("✅ [AudioChunkingModule] Stopped AVAudioEngine")
+        }
         inputNode = nil
+        audioEngine = nil
         
         // Wait for any pending processing to complete, then send final chunk
         processingQueue.async { [weak self] in
