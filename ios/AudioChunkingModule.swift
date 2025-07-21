@@ -140,7 +140,6 @@ class AudioChunkingModule: RCTEventEmitter {
             withUnsafeBytes(of: int16.littleEndian) { data.append(contentsOf: $0) }
         }
         audioBuffer.append(data)
-        sendDebugLog("Appended buffer data, total size: \(audioBuffer.count) bytes")
     }
 
     private func createAndSendChunk() {
