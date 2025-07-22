@@ -149,8 +149,8 @@ class AudioChunkingModule: RCTEventEmitter {
                                         interleaved: true),
                 let pcmBuf = AVAudioPCMBuffer(pcmFormat: fmt,
                                                 frameCapacity: frames) else {
-            print("⚠️ Unable to create PCM buffer")
-            return
+                sendEvent(withName: "onDebug", body: "⚠️ Unable to create PCM buffer")
+                return
             }
             pcmBuf.frameLength = frames
 
@@ -182,7 +182,7 @@ class AudioChunkingModule: RCTEventEmitter {
             sendEvent(withName: "onChunkReady", body: payload)
         }
         catch {
-            print("❌ M4A export failed:", error)
+            sendEvent(withName: "onDebug", body: "❌ M4A export failed: \(error)")
         }
 
         // 9) Clear your PCM buffer for the next chunk
