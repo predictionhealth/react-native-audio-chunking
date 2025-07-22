@@ -1,6 +1,7 @@
 // AudioChunkingModule.swift
 import Foundation
 import AVFoundation
+import React  // Import React Native bridge
 
 @objc(AudioChunkingModule)
 class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
@@ -49,8 +50,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
             recorder?.delegate = self
             recorder?.record(forDuration: chunkDuration)
         } catch {
-            print("Failed to start recorder": \(error)
-)
+            print("Failed to start recorder: \(error)")
         }
     }
 
