@@ -144,13 +144,12 @@ class AudioChunkingModule: RCTEventEmitter {
             sendDebugLog("No channel data in buffer")
             return
         }
-        var data = Data()
+        var data = Data(capacity: frameLen * MemoryLayout<Int16>.size)
         for i in 0..<frameLen {
             let sample = channel[i]
             let int16 = Int16(sample * Float(Int16.max))
-            withUnsafeBytes(of: int16.littleEndian) { bytes in
-                data.append(bytes.baseAddress!, count: MemoryLayout<Int16>.size)
-            }
+            let bytes = withUnsafeBytes(of: int16.littleEndian) { Data($0) }
+            data.append(bytes)
         }
         audioBuffer.append(data)
         sendDebugLog("Appended buffer data, total size: \(audioBuffer.count) bytes")
