@@ -115,14 +115,9 @@ class AudioChunkingModule: RCTEventEmitter {
         let elapsedTime = (currentTime - recordingStartTime) * 1000 // Convert to milliseconds
         
         if elapsedTime >= Double(chunkDurationMs) {
-            let expectedChunkNumber = Int(elapsedTime / Double(chunkDurationMs))
-            
-            // Only create chunk if we haven't created this chunk number yet
-            if expectedChunkNumber > chunkCounter {
-                chunkCounter = expectedChunkNumber
-                createAndSendChunk()
-                recordingStartTime = currentTime // Reset for next chunk
-            }
+            chunkCounter += 1
+            createAndSendChunk()
+            recordingStartTime = currentTime // Reset for next chunk
         }
     }
     
