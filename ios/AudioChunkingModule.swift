@@ -148,7 +148,9 @@ class AudioChunkingModule: RCTEventEmitter {
         for i in 0..<frameLen {
             let sample = channel[i]
             let int16 = Int16(sample * Float(Int16.max))
-            data.append(withUnsafeBytes(of: int16.littleEndian) { $0 })
+            withUnsafeBytes(of: int16.littleEndian) { bytes in
+                data.append(bytes.baseAddress!, count: MemoryLayout<Int16>.size)
+            }
         }
         audioBuffer.append(data)
         sendDebugLog("Appended buffer data, total size: \(audioBuffer.count) bytes")
