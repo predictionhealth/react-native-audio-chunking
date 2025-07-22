@@ -21,7 +21,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     override func supportedEvents() -> [String]! {
-        return ["onChunkReady"]
+        return ["onChunkReady", "onDebug"]
     }
     
     @objc

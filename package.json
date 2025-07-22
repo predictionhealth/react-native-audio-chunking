@@ -1,6 +1,6 @@
 {
   "name": "react-native-audio-chunking",
-  "version": "1.0.39",
+  "version": "1.0.40",
   "description": "React Native module for chunked audio recording",
   "main": "index.js",
   "scripts": {
