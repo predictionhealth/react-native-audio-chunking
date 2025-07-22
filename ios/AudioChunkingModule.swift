@@ -16,7 +16,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     @objc
-    func start() {
+    func startChunkedRecording() {
         guard !isRecording else { return }
         isRecording = true
         chunkIndex = 0
@@ -68,7 +68,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     @objc
-    func stop() {
+    func stopRecording() {
         guard isRecording else { return }
         isRecording = false
         recorder?.stop()
