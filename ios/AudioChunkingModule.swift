@@ -1,175 +1,124 @@
+```swift
+// AudioChunkingModule.swift
+
 import Foundation
 import AVFoundation
 import React
 
 @objc(AudioChunkingModule)
-class AudioChunkingModule: RCTEventEmitter {
-    
-    private var audioEngine: AVAudioEngine?
-    private var inputNode: AVAudioInputNode?
-    private var isRecording = false
-    private var chunkDurationMs: Int = 10000 // 10 seconds default
-    private var recordingStartTime: TimeInterval = 0
-    private var audioBuffer = Data()
-    private var sampleRate: Double = 22050
-    private var chunkCounter = 0
-    private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
-    
-    override init() {
-        super.init()
-        setupAudioSession()
+class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
+  private var recorder: AVAudioRecorder?
+  private var isRecording = false
+  private var chunkIndex = 0
+  private let chunkDuration: TimeInterval = 10.0
+
+  // MARK: - RCTEventEmitter boilerplate
+
+  @objc
+  override static func requiresMainQueueSetup() -> Bool {
+    return false
+  }
+
+  @objc
+  override func supportedEvents() -> [String]! {
+    return ["onChunkReady"]
+  }
+
+  @objc
+  override func constantsToExport() -> [AnyHashable: Any]! {
+    return [:]
+  }
+
+  // MARK: - Public methods
+
+  @objc(startChunkedRecording:rejecter:)
+  func startChunkedRecording(_ resolve: @escaping RCTPromiseResolveBlock,
+                             rejecter reject: @escaping RCTPromiseRejectBlock) {
+    guard !isRecording else {
+      resolve(nil)
+      return
     }
-    
-    override func supportedEvents() -> [String]! {
-        return ["onChunkReady"]
+    chunkIndex = 0
+    isRecording = true
+
+    AVAudioSession.sharedInstance().requestRecordPermission { granted in
+      guard granted else {
+        reject("PERMISSION_DENIED", "User denied microphone access", nil)
+        return
+      }
+      do {
+        try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
+        try AVAudioSession.sharedInstance().setActive(true)
+
+        self.recordNextChunk()
+        DispatchQueue.main.async { resolve(nil) }
+      } catch {
+        self.isRecording = false
+        reject("AUDIO_SETUP_FAILED", error.localizedDescription, error)
+      }
     }
-    
-    @objc
-    override static func requiresMainQueueSetup() -> Bool {
-        return false
+  }
+
+  @objc(stopRecording:rejecter:)
+  func stopRecording(_ resolve: @escaping RCTPromiseResolveBlock,
+                     rejecter reject: @escaping RCTPromiseRejectBlock) {
+    guard isRecording else {
+      resolve(nil)
+      return
     }
-    
-    private func setupAudioSession() {
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.record, mode: .default)
-            try audioSession.setActive(true)
-        } catch {
-            print("Failed to setup audio session: \(error)")
-        }
+    isRecording = false
+    recorder?.stop()
+    do {
+      try AVAudioSession.sharedInstance().setActive(false)
+      resolve(nil)
+    } catch {
+      reject("AUDIO_TEARDOWN_FAILED", error.localizedDescription, error)
     }
-    
-    private func resetModuleState() {
-        isRecording = false
-        audioBuffer.removeAll()
-        recordingStartTime = 0
-        chunkCounter = 0
+  }
+
+  // MARK: - Internal chunking logic
+
+  private func recordNextChunk() {
+    let fileName = "chunk_\(chunkIndex).m4a"
+    let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+
+    let settings: [String: Any] = [
+      AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+      AVSampleRateKey: 44_100,
+      AVNumberOfChannelsKey: 1,
+      AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+    ]
+
+    do {
+      recorder = try AVAudioRecorder(url: fileURL, settings: settings)
+      recorder?.delegate = self
+      recorder?.record(forDuration: chunkDuration)
+    } catch {
+      print("Failed to start chunk recorder:", error)
+      isRecording = false
     }
-    
-    @objc
-    func startChunkedRecording(_ resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
-        if isRecording {
-            rejecter("ALREADY_RECORDING", "Recording is already in progress", nil)
-            return
-        }
-        
-        // Reset state before starting new recording
-        resetModuleState()
-        
-        self.chunkDurationMs = 10000 // Static 10 seconds
-        
-        do {
-            audioEngine = AVAudioEngine()
-            inputNode = audioEngine?.inputNode
-            
-            guard let inputNode = inputNode else {
-                rejecter("INIT_FAILED", "Failed to get input node", nil)
-                return
-            }
-            
-            let recordingFormat = inputNode.outputFormat(forBus: 0)
-            sampleRate = recordingFormat.sampleRate
-            
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                self?.processingQueue.async {
-                    self?.processAudioBuffer(buffer)
-                }
-            }
-            
-            audioEngine?.prepare()
-            try audioEngine?.start()
-            
-            isRecording = true
-            recordingStartTime = CACurrentMediaTime()
-            audioBuffer.removeAll()
-            chunkCounter = 0
-            
-            resolver("Recording started successfully")
-        } catch {
-            // Reset flags on error
-            resetModuleState()
-            rejecter("START_FAILED", "Failed to start recording: \(error.localizedDescription)", error)
-        }
+  }
+
+  // Called when each chunk finishes
+  func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+    guard flag else {
+      print("Chunk recording failed")
+      return
     }
-    
-    private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        guard isRecording else { return }
-        
-        // Convert buffer to Data
-        let frameLength = Int(buffer.frameLength)
-        let channelData = buffer.floatChannelData?[0]
-        
-        var audioData = Data()
-        for i in 0..<frameLength {
-            let sample = channelData?[i] ?? 0.0
-            let int16Sample = Int16(sample * Float(Int16.max))
-            withUnsafeBytes(of: int16Sample.littleEndian) { bytes in
-                audioData.append(contentsOf: bytes)
-            }
-        }
-        
-        audioBuffer.append(audioData)
-        
-        // Check if it's time to create a chunk
-        let currentTime = CACurrentMediaTime()
-        let elapsedTime = (currentTime - recordingStartTime) * 1000 // Convert to milliseconds
-        
-        if elapsedTime >= Double(chunkDurationMs) {
-            chunkCounter += 1
-            createAndSendChunk()
-            recordingStartTime = currentTime // Reset for next chunk
-        }
+    let url = recorder.url
+    do {
+      let data = try Data(contentsOf: url)
+      let b64  = data.base64EncodedString()
+      sendEvent(withName: "onChunkReady", body: [
+        "base64": b64,
+        "chunkNumber": chunkIndex
+      ])
+      chunkIndex += 1
+      if isRecording {
+        recordNextChunk()
+      }
+    } catch {
+      print("Failed to read chunk file:", error)
     }
-    
-    private func createAndSendChunk() {
-        let base64Audio = audioBuffer.base64EncodedString()
-        
-        let chunkData: [String: Any] = [
-            "audioData": base64Audio,
-            "format": "pcm",
-            "sampleRate": Int(sampleRate),
-            "channels": 1,
-            "bitsPerSample": 16,
-            "chunkNumber": chunkCounter
-        ]
-        
-        sendEvent(withName: "onChunkReady", body: chunkData)
-        
-        // Clear buffer for next chunk
-        audioBuffer.removeAll()
-    }
-    
-    @objc
-    func stopRecording(_ resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
-        if !isRecording {
-            rejecter("NOT_RECORDING", "No recording in progress", nil)
-            return
-        }
-        
-        // Stop recording immediately
-        isRecording = false
-        
-        // Remove tap and stop engine
-        inputNode?.removeTap(onBus: 0)
-        audioEngine?.stop()
-        audioEngine = nil
-        inputNode = nil
-        
-        // Wait for any pending processing to complete, then send final chunk
-        processingQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Send final chunk if there's remaining data
-            if !self.audioBuffer.isEmpty {
-                self.createAndSendChunk()
-            }
-            
-            // Reset all state
-            self.resetModuleState()
-            
-            DispatchQueue.main.async {
-                resolver("Recording stopped successfully")
-            }
-        }
-    }
+  }
 }
