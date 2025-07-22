@@ -47,7 +47,7 @@ class AudioChunkingModule: RCTEventEmitter {
     }
     
     @objc
-    func startChunkedRecording(_ chunkDuration: Int, resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
+    func startChunkedRecording(_ resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
         if isRecording {
             rejecter("ALREADY_RECORDING", "Recording is already in progress", nil)
             return
@@ -56,7 +56,7 @@ class AudioChunkingModule: RCTEventEmitter {
         // Reset state before starting new recording
         resetModuleState()
         
-        self.chunkDurationMs = chunkDuration
+        self.chunkDurationMs = 10000 // Static 10 seconds
         
         do {
             audioEngine = AVAudioEngine()
