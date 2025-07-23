@@ -141,26 +141,27 @@ class AudioChunkingModule: RCTEventEmitter {
             let outFile = try AVAudioFile(forWriting: fileURL,
                                         settings: exportSettings)
 
-            // 4) Turn your Data(buffered PCM Int16) into a PCM buffer
-            let frames    = AVAudioFrameCount(audioBuffer.count / MemoryLayout<Int16>.size)
-            guard let fmt  = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                        sampleRate: sampleRate,
-                                        channels: 1,
-                                        interleaved: true),
-                let pcmBuf = AVAudioPCMBuffer(pcmFormat: fmt,
+            // 4) Wrap your Int16 data into a Float32 buffer (AVAudioCommonFormat requires floats)
+            let frames = AVAudioFrameCount(audioBuffer.count / MemoryLayout<Int16>.size)
+            guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                            sampleRate: sampleRate,
+                                            channels: 1,
+                                            interleaved: false),
+                    let pcmBuf = AVAudioPCMBuffer(pcmFormat: fmt,
                                                 frameCapacity: frames) else {
-                sendEvent(withName: "onDebug", body: "⚠️ Unable to create PCM buffer")
+                sendEvent(withName: "onDebug", body: "⚠️ Unable to create Float32 PCM buffer")
                 return
             }
             pcmBuf.frameLength = frames
 
-            // 5) Copy your raw bytes into the PCM buffer
-            let dst = pcmBuf.int16ChannelData![0]
-            audioBuffer.withUnsafeBytes { src in
-            let samples = src.bindMemory(to: Int16.self)
-            for i in 0..<Int(frames) {
-                dst[i] = samples[i]
-            }
+            // 5) Normalize and copy Int16 → Float32
+            let floatPtr = pcmBuf.floatChannelData![0]
+            audioBuffer.withUnsafeBytes { raw in
+                let int16Ptr = raw.bindMemory(to: Int16.self)
+                for i in 0..<Int(frames) {
+                // convert back to –1.0…+1.0
+                floatPtr[i] = Float(int16Ptr[i]) / Float(Int16.max)
+                }
             }
 
             // 6) Write the buffer into the .m4a file
