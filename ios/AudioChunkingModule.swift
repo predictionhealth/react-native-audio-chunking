@@ -140,7 +140,8 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
                 "bitsPerSample": 16,
                 "chunkNumber": chunkCounter
             ]
-            sendEvent(withName: "onChunkReady", body: payload)
+            let eventName = isRecording ? "onChunkReady" : "onLastChunkReady"
+            sendEvent(withName: eventName, body: payload)
             chunkCounter += 1
             if isRecording {
                 recordNextChunk()
