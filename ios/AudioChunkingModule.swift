@@ -32,7 +32,7 @@ class AudioChunkingModule: RCTEventEmitter {
     private func setupAudioSession() {
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.record, mode: .default)
+            try audioSession.setCategory(.playAndRecord, mode: .default)
             try audioSession.setActive(true)
         } catch {
             print("Failed to setup audio session: \(error)")
@@ -141,6 +141,8 @@ class AudioChunkingModule: RCTEventEmitter {
             let outFile = try AVAudioFile(forWriting: fileURL,
                                         settings: exportSettings)
 
+            sendEvent(withName: "onDebug", body: "PCM size: \(audioBuffer.count) bytes")
+
             // 4) Wrap your Int16 data into a Float32 buffer (AVAudioCommonFormat requires floats)
             let frames = AVAudioFrameCount(audioBuffer.count / MemoryLayout<Int16>.size)
             guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -169,6 +171,15 @@ class AudioChunkingModule: RCTEventEmitter {
 
             // 7) Read it back & Base64-encode
             let m4aData      = try Data(contentsOf: fileURL)
+
+            // ─── DEBUG PLAYBACK ────────────────────────────────
+            // Play it locally so you can hear if it actually contains audio:
+            let player = try AVAudioPlayer(data: m4aData)
+            player.prepareToPlay()
+            player.play()
+            print("▶️ [Debug] Playing chunk \(chunkCounter) locally")
+            // ────────────────────────────────────────────────────
+
             let base64String = m4aData.base64EncodedString()
 
             // 8) Emit with “format” now set to “m4a”
