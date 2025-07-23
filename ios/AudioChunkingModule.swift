@@ -8,7 +8,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private var recorder: AVAudioRecorder?
     private var isRecording = false
     private var chunkCounter = 0
-    private let chunkDurationMs: Int = 10000 // 10 seconds
+    private let chunkDurationMs: Int = 120000
     private var sampleRate: Double = 22050
 
     // Legacy properties (unused with recorder approach)
