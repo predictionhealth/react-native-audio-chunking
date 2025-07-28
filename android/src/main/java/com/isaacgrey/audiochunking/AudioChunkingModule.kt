@@ -94,6 +94,26 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) : ReactContextB
             try {
                 recorder.stop()
                 recorder.release()
+                
+                // Process the final chunk
+                currentChunkFile?.let { file ->
+                    if (file.exists() && file.length() > 0) {
+                        val audioData = file.readBytes()
+                        val base64String = Base64.encodeToString(audioData, Base64.NO_WRAP)
+                        
+                        val payload = Arguments.createMap().apply {
+                            putString("audioData", base64String)
+                            putString("format", "m4a")
+                            putInt("sampleRate", SAMPLE_RATE)
+                            putInt("channels", 1)
+                            putInt("bitsPerSample", 16)
+                            putInt("chunkNumber", chunkCounter)
+                        }
+                        
+                        sendEvent("onLastChunkReady", payload)
+                        chunkCounter++
+                    }
+                }
             } catch (e: Exception) {
                 sendDebugEvent("Error stopping recorder: ${e.message}")
             }
