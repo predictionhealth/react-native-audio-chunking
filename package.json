@@ -17,8 +17,7 @@
       "podspec": "AudioChunkingModule.podspec"
     },
     "android": {
-      "package": "com.isaacgrey.audiochunking",
-      "sourceDir": "./android/src/main"
+      "package": "com.isaacgrey.audiochunking"
     }
   }
 }

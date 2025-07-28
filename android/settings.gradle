@@ -1,3 +1,1 @@
-rootProject.name = 'AudioChunkingModule'
-include ':react-native-audio-chunking'
-project(':react-native-audio-chunking').projectDir = new File(rootProject.projectDir, '../android') 
+rootProject.name = 'react-native-audio-chunking' 

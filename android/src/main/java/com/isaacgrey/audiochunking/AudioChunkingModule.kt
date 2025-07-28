@@ -14,7 +14,6 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.util.*
 
-@ReactModule(name = AudioChunkingModule.NAME)
 class AudioChunkingModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
     companion object {
         const val NAME = "AudioChunkingModule"
