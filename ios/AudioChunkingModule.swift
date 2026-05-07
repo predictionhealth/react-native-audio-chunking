@@ -17,6 +17,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private var recordingStartTime: TimeInterval = 0
     private var audioBuffer = Data()
     private let processingQueue = DispatchQueue(label: "audio.processing", qos: .userInitiated)
+    private var preferredInputUid: String?
 
     // MARK: - RCTEventEmitter
     @objc
@@ -26,7 +27,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
 
     @objc
     override func supportedEvents() -> [String]! {
-        return ["onChunkReady", "onLastChunkReady", "onDebug"]
+        return ["onChunkReady", "onLastChunkReady", "onDebug", "onAudioRouteChange"]
     }
 
     @objc
@@ -38,12 +39,22 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     override init() {
         super.init()
         setupAudioSession()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(routeDidChange(_:)),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .default)
+            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
             try session.setActive(true)
         } catch {
             sendEvent(withName: "onDebug", body: "Failed to setup audio session: \(error)")
@@ -53,6 +64,55 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private func resetModuleState() {
         isRecording = false
         chunkCounter = 0
+    }
+
+    // MARK: - Route Change
+    @objc private func routeDidChange(_ notification: Notification) {
+        let inputs = availableInputsList()
+        sendEvent(withName: "onAudioRouteChange", body: ["inputs": inputs])
+    }
+
+    private func availableInputsList() -> [[String: String]] {
+        let session = AVAudioSession.sharedInstance()
+        return (session.availableInputs ?? []).map { port in
+            [
+                "name": port.portName,
+                "uid": port.uid,
+                "portType": port.portType.rawValue
+            ]
+        }
+    }
+
+    // MARK: - Input Selection
+    @objc(getAvailableInputs:rejecter:)
+    func getAvailableInputs(_ resolve: @escaping RCTPromiseResolveBlock,
+                            rejecter reject: @escaping RCTPromiseRejectBlock) {
+        resolve(availableInputsList())
+    }
+
+    @objc(setPreferredInput:resolver:rejecter:)
+    func setPreferredInput(_ uid: String,
+                           resolver resolve: @escaping RCTPromiseResolveBlock,
+                           rejecter reject: @escaping RCTPromiseRejectBlock) {
+        let session = AVAudioSession.sharedInstance()
+        guard let port = session.availableInputs?.first(where: { $0.uid == uid }) else {
+            reject("INPUT_NOT_FOUND", "No input with uid \(uid)", nil)
+            return
+        }
+        do {
+            try session.setPreferredInput(port)
+            preferredInputUid = uid
+            resolve(nil)
+        } catch {
+            reject("SET_INPUT_FAILED", error.localizedDescription, error)
+        }
+    }
+
+    private func reapplyPreferredInput() {
+        guard let uid = preferredInputUid else { return }
+        let session = AVAudioSession.sharedInstance()
+        guard let port = session.availableInputs?.first(where: { $0.uid == uid }) else { return }
+        try? session.setPreferredInput(port)
     }
 
     // MARK: - Recording Control
@@ -72,7 +132,6 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
                 return
             }
             do {
-                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
                 try AVAudioSession.sharedInstance().setActive(true)
 
                 self.recordNextChunk()
