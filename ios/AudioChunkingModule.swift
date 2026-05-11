@@ -45,6 +45,12 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(audioInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
     }
 
     deinit {
@@ -68,8 +74,24 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
 
     // MARK: - Route Change
     @objc private func routeDidChange(_ notification: Notification) {
-        let inputs = availableInputsList()
-        sendEvent(withName: "onAudioRouteChange", body: ["inputs": inputs])
+        let reasonValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 999
+        let session = AVAudioSession.sharedInstance()
+        let availableInputs = availableInputsList()
+        let activeInputs = session.currentRoute.inputs.map { port in
+            ["name": port.portName, "uid": port.uid, "portType": port.portType.rawValue]
+        }
+        sendEvent(withName: "onDebug", body: "[RouteChange] reason=\(reasonValue) preferredInputUid=\(preferredInputUid ?? "nil") isRecording=\(isRecording) available=\(availableInputs.map { $0["name"] ?? "" }) active=\(activeInputs.map { $0["name"] ?? "" })")
+        sendEvent(withName: "onAudioRouteChange", body: [
+            "inputs": availableInputs,
+            "activeInputs": activeInputs,
+            "reason": reasonValue
+        ])
+    }
+
+    @objc private func audioInterruption(_ notification: Notification) {
+        let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 999
+        sendEvent(withName: "onDebug", body: "[Interruption] type=\(typeValue) isRecording=\(isRecording) preferredInputUid=\(preferredInputUid ?? "nil")")
+        // type 0 = began, type 1 = ended
     }
 
     private func availableInputsList() -> [[String: String]] {
@@ -108,6 +130,18 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
         }
     }
 
+    @objc(clearPreferredInput:rejecter:)
+    func clearPreferredInput(_ resolve: @escaping RCTPromiseResolveBlock,
+                             rejecter reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            try AVAudioSession.sharedInstance().setPreferredInput(nil)
+            preferredInputUid = nil
+            resolve(nil)
+        } catch {
+            reject("CLEAR_INPUT_FAILED", error.localizedDescription, error)
+        }
+    }
+
     private func reapplyPreferredInput() {
         guard let uid = preferredInputUid else { return }
         let session = AVAudioSession.sharedInstance()
@@ -134,6 +168,30 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
             do {
                 try AVAudioSession.sharedInstance().setActive(true)
 
+                // Guard against stale preferred input: the device may have been removed while the
+                // session was inactive (iOS doesn't fire oldDeviceUnavailable in that case).
+                // If preferredInput is no longer in the active route, clear it so we fall back
+                // to built-in, and notify JS so its state catches up before recording starts.
+                if let uid = self.preferredInputUid {
+                    let session = AVAudioSession.sharedInstance()
+                    let activeInputs = session.currentRoute.inputs
+                    if !activeInputs.contains(where: { $0.uid == uid }) {
+                        self.sendEvent(withName: "onDebug", body: "[StartChunked] preferredInput \(uid) not in active route — clearing to built-in")
+                        try? session.setPreferredInput(nil)
+                        self.preferredInputUid = nil
+                        let availList = self.availableInputsList()
+                        let activeList = activeInputs.map { p in
+                            ["name": p.portName, "uid": p.uid, "portType": p.portType.rawValue]
+                        }
+                        self.sendEvent(withName: "onAudioRouteChange", body: [
+                            "inputs": availList,
+                            "activeInputs": activeList,
+                            "reason": 2  // signal to JS: treat as oldDeviceUnavailable
+                        ])
+                    }
+                }
+
+                self.sendEvent(withName: "onDebug", body: "[StartChunked] preferredInputUid=\(self.preferredInputUid ?? "nil")")
                 self.recordNextChunk()
                 DispatchQueue.main.async { resolve(nil) }
             } catch {
@@ -152,12 +210,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
         }
         isRecording = false
         recorder?.stop()
-        do {
-            try AVAudioSession.sharedInstance().setActive(false)
-            resolve(nil)
-        } catch {
-            reject("AUDIO_TEARDOWN_FAILED", error.localizedDescription, error)
-        }
+        resolve(nil)
     }
 
     // MARK: - Chunking Logic via AVAudioRecorder
@@ -184,6 +237,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        sendEvent(withName: "onDebug", body: "[ChunkFinished] flag=\(flag) isRecording=\(isRecording) chunk=\(chunkCounter)")
         guard flag else {
             sendEvent(withName: "onDebug", body: "Chunk encoding failed")
             return
