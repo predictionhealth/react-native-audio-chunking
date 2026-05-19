@@ -1,7 +1,10 @@
 package com.isaacgrey.audiochunking
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioDeviceCallback
 import android.os.Handler
@@ -22,6 +25,7 @@ import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.File
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class AudioChunkingModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
@@ -31,6 +35,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         private const val CHUNK_DURATION_MS = 120000L
         private const val SAMPLE_RATE = 44100
         private const val BIT_RATE = 128000
+        private const val BT_SCO_CONNECT_TIMEOUT_MS = 5000L
     }
 
     private var audioRecord: AudioRecord? = null
@@ -44,14 +49,19 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     @Volatile private var stopChunkRequested = false
     private var chunkCounter = 0
     private var selectedDeviceId: Int? = null
+    private var bluetoothScoStarted = false
+    private var scoReceiver: BroadcastReceiver? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val audioDeviceCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                sendDebugEvent("AudioDeviceCallback: devices added: ${addedDevices.joinToString { "${it.productName}(${audioDeviceTypeToString(it.type)})" }}")
                 val payload = Arguments.createMap().apply { putArray("inputs", buildInputsList()) }
                 sendEvent("onAudioRouteChange", payload)
             }
             override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                sendDebugEvent("AudioDeviceCallback: devices removed: ${removedDevices.joinToString { "${it.productName}(${audioDeviceTypeToString(it.type)})" }}")
                 val payload = Arguments.createMap().apply { putArray("inputs", buildInputsList()) }
                 sendEvent("onAudioRouteChange", payload)
             }
@@ -86,6 +96,8 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             recordingThread?.join(3000)
             recordingThread = null
             releaseRecordingResources()
+            stopBluetoothScoIfStarted()
+            unregisterScoReceiver()
         }
     }
 
@@ -139,24 +151,40 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             return
         }
         selectedDeviceId = deviceId
+        sendDebugEvent("setPreferredInput: id=$deviceId name=${device.productName} type=${audioDeviceTypeToString(device.type)}")
         promise.resolve(null)
     }
 
     @ReactMethod
     fun startChunkedRecording(promise: Promise) {
-        if (isRecording) {
-            promise.resolve(null)
-            return
-        }
+        if (isRecording) { promise.resolve(null); return }
         if (ActivityCompat.checkSelfPermission(reactApplicationContext, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            promise.reject("PERMISSION_DENIED", "User denied microphone permission")
-            return
+            promise.reject("PERMISSION_DENIED", "User denied microphone permission"); return
         }
         try {
             isRecording = true
             chunkCounter = 0
-            recordNextChunk()
-            promise.resolve(null)
+
+            val isBtScoDevice = selectedDeviceId?.let { id ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    val device = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == id }
+                    sendDebugEvent("startChunkedRecording: selectedDeviceId=$id name=${device?.productName} type=${device?.type?.let { audioDeviceTypeToString(it) } ?: "null"}")
+                    device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                } else false
+            } ?: run {
+                sendDebugEvent("startChunkedRecording: no preferred device, using default mic")
+                false
+            }
+
+            if (isBtScoDevice) {
+                sendDebugEvent("Bluetooth SCO device — must call startBluetoothSco() before AudioRecord")
+                startBluetoothScoAndRecord(promise)
+            } else {
+                sendDebugEvent("startChunkedRecording: non-SCO path, starting directly")
+                recordNextChunk()
+                promise.resolve(null)
+            }
         } catch (e: Exception) {
             isRecording = false
             promise.reject("AUDIO_SETUP_FAILED", e.message, e)
@@ -174,9 +202,82 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             chunkTimer?.cancel()
             chunkTimer = null
             finishCurrentChunk(isLast = true)
+            stopBluetoothScoIfStarted()
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("AUDIO_TEARDOWN_FAILED", e.message, e)
+        }
+    }
+
+    private fun startBluetoothScoAndRecord(promise: Promise) {
+        val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val promiseSettled = AtomicBoolean(false)
+
+        fun settleOnce(block: () -> Unit) {
+            if (promiseSettled.compareAndSet(false, true)) block()
+        }
+
+        val timeoutRunnable = Runnable {
+            sendDebugEvent("BT SCO connect timeout after ${BT_SCO_CONNECT_TIMEOUT_MS}ms — proceeding anyway")
+            unregisterScoReceiver()
+            settleOnce {
+                try {
+                    if (isRecording) { recordNextChunk(); promise.resolve(null) }
+                    else { isRecording = false; promise.reject("RECORDING_CANCELLED", "Cancelled before SCO connected") }
+                } catch (e: Exception) { isRecording = false; promise.reject("AUDIO_SETUP_FAILED", e.message, e) }
+            }
+        }
+
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val state = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
+                sendDebugEvent("SCO broadcast: state=$state (DISCONNECTED=0, CONNECTED=1, CONNECTING=2)")
+                when (state) {
+                    AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                        sendDebugEvent("BT SCO connected — starting AudioRecord")
+                        mainHandler.removeCallbacks(timeoutRunnable)
+                        unregisterScoReceiver()
+                        settleOnce {
+                            try { recordNextChunk(); promise.resolve(null) }
+                            catch (e: Exception) { isRecording = false; promise.reject("AUDIO_SETUP_FAILED", e.message, e) }
+                        }
+                    }
+                    AudioManager.SCO_AUDIO_STATE_DISCONNECTED ->
+                        sendDebugEvent("BT SCO DISCONNECTED — waiting for CONNECTED or timeout")
+                    AudioManager.SCO_AUDIO_STATE_CONNECTING ->
+                        sendDebugEvent("BT SCO CONNECTING — waiting...")
+                    else -> sendDebugEvent("BT SCO unknown state=$state")
+                }
+            }
+        }
+        scoReceiver = receiver
+        reactApplicationContext.registerReceiver(receiver, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
+
+        bluetoothScoStarted = true
+        audioManager.startBluetoothSco()
+        @Suppress("DEPRECATION")
+        audioManager.isBluetoothScoOn = true
+        sendDebugEvent("startBluetoothSco() called — timeout in ${BT_SCO_CONNECT_TIMEOUT_MS}ms")
+        mainHandler.postDelayed(timeoutRunnable, BT_SCO_CONNECT_TIMEOUT_MS)
+    }
+
+    private fun unregisterScoReceiver() {
+        scoReceiver?.let {
+            try { reactApplicationContext.unregisterReceiver(it) } catch (_: Exception) {}
+            scoReceiver = null
+        }
+    }
+
+    private fun stopBluetoothScoIfStarted() {
+        if (bluetoothScoStarted) {
+            sendDebugEvent("Stopping Bluetooth SCO")
+            try {
+                val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                audioManager.stopBluetoothSco()
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = false
+            } catch (_: Exception) {}
+            bluetoothScoStarted = false
         }
     }
 
@@ -207,7 +308,12 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
                     selectedDeviceId?.let { id ->
                         val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                         val device = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == id }
-                        device?.let { record.setPreferredDevice(it) }
+                        if (device != null) {
+                            sendDebugEvent("recordNextChunk: setPreferredDevice name=${device.productName} type=${audioDeviceTypeToString(device.type)} chunk=$chunkCounter")
+                            record.setPreferredDevice(device)
+                        } else {
+                            sendDebugEvent("recordNextChunk: preferred device id=$id not found — using default")
+                        }
                     }
                 }
         } else {
@@ -240,6 +346,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         stopChunkRequested = false
 
         ar.startRecording()
+        sendDebugEvent("recordNextChunk: AudioRecord started, recordingState=${ar.recordingState} (RECORDING=3) chunk=$chunkCounter")
         recordingThread = Thread { runRecordingLoop(ar, codec, muxer) }.also { it.start() }
 
         chunkTimer = Timer()
