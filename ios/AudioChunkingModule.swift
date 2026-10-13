@@ -11,6 +11,13 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private let chunkDurationMs: Int = 120000
     private var sampleRate: Double = 22050
 
+    // Interruption state (e.g. incoming phone call). When an interruption begins the
+    // system stops our recorder; we suspend the chunk loop and resume it when the
+    // interruption ends rather than letting the chain die silently.
+    private var wasInterrupted = false
+    // Guards against emitting onLastChunkReady more than once so JS never double-transcribes.
+    private var lastChunkEmitted = false
+
     // Legacy properties (unused with recorder approach)
     private var audioEngine: AVAudioEngine?
     private var inputNode: AVAudioInputNode?
@@ -70,6 +77,17 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private func resetModuleState() {
         isRecording = false
         chunkCounter = 0
+        wasInterrupted = false
+        lastChunkEmitted = false
+    }
+
+    // Emits the terminal onLastChunkReady event at most once per recording session so the
+    // JS layer always leaves its "Processing" state, even when the final chunk is missing
+    // (e.g. the recorder was already torn down by an interruption).
+    private func emitLastChunk(_ payload: [String: Any]) {
+        guard !lastChunkEmitted else { return }
+        lastChunkEmitted = true
+        sendEvent(withName: "onLastChunkReady", body: payload)
     }
 
     // MARK: - Route Change
@@ -89,9 +107,42 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     @objc private func audioInterruption(_ notification: Notification) {
-        let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 999
-        sendEvent(withName: "onDebug", body: "[Interruption] type=\(typeValue) isRecording=\(isRecording) preferredInputUid=\(preferredInputUid ?? "nil")")
-        // type 0 = began, type 1 = ended
+        let info = notification.userInfo
+        let typeValue = info?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 999
+        sendEvent(withName: "onDebug", body: "[Interruption] type=\(typeValue) isRecording=\(isRecording) wasInterrupted=\(wasInterrupted) preferredInputUid=\(preferredInputUid ?? "nil")")
+
+        guard let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+
+        switch type {
+        case .began:
+            // The system has paused/stopped our recorder. Suspend the chunk loop so the
+            // delegate does NOT auto-advance onto a dead session, and flush whatever audio
+            // was captured before the interruption. We resume on .ended.
+            guard isRecording, !wasInterrupted else { return }
+            wasInterrupted = true
+            recorder?.stop()
+
+        case .ended:
+            // Re-activate the session and restart the chunk loop so recording continues and
+            // the terminal onLastChunkReady will still fire when the user stops.
+            guard isRecording, wasInterrupted else { return }
+            wasInterrupted = false
+            let optionsValue = info?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+                reapplyPreferredInput()
+                recordNextChunk()
+                sendEvent(withName: "onDebug", body: "[Interruption] resumed recording shouldResume=\(options.contains(.shouldResume))")
+            } catch {
+                // Leave isRecording true; stopRecording still has a fallback that guarantees
+                // JS won't hang in "Processing" even if we can't reactivate here.
+                sendEvent(withName: "onDebug", body: "[Interruption] failed to resume: \(error)")
+            }
+
+        @unknown default:
+            break
+        }
     }
 
     private func availableInputsList() -> [[String: String]] {
@@ -159,6 +210,8 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
         }
         isRecording = true
         chunkCounter = 0
+        wasInterrupted = false
+        lastChunkEmitted = false
 
         AVAudioSession.sharedInstance().requestRecordPermission { granted in
             guard granted else {
@@ -209,6 +262,22 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
             return
         }
         isRecording = false
+
+        if wasInterrupted {
+            // The recorder was already torn down by an interruption and will not flush a
+            // final chunk, so stop() would never trigger the delegate. Signal completion
+            // directly so JS doesn't hang in "Processing" forever.
+            wasInterrupted = false
+            emitLastChunk([
+                "audioData": "",
+                "format": "m4a",
+                "chunkNumber": chunkCounter,
+                "empty": true
+            ])
+            resolve(nil)
+            return
+        }
+
         recorder?.stop()
         resolve(nil)
     }
@@ -237,9 +306,23 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        sendEvent(withName: "onDebug", body: "[ChunkFinished] flag=\(flag) isRecording=\(isRecording) chunk=\(chunkCounter)")
+        sendEvent(withName: "onDebug", body: "[ChunkFinished] flag=\(flag) isRecording=\(isRecording) wasInterrupted=\(wasInterrupted) chunk=\(chunkCounter)")
         guard flag else {
-            sendEvent(withName: "onDebug", body: "Chunk encoding failed")
+            sendEvent(withName: "onDebug", body: "Chunk encoding failed (flag=false)")
+            if !isRecording {
+                // Stop was requested but the final chunk failed to encode. Still signal
+                // completion so JS doesn't hang in "Processing".
+                emitLastChunk([
+                    "audioData": "",
+                    "format": "m4a",
+                    "chunkNumber": chunkCounter,
+                    "empty": true
+                ])
+            } else if !wasInterrupted {
+                // Unexpected failure while recording (not an interruption) — keep the loop
+                // alive. While interrupted we wait for the .ended handler to restart it.
+                recordNextChunk()
+            }
             return
         }
         do {
@@ -253,14 +336,30 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
                 "bitsPerSample": 16,
                 "chunkNumber": chunkCounter
             ]
-            let eventName = isRecording ? "onChunkReady" : "onLastChunkReady"
-            sendEvent(withName: eventName, body: payload)
-            chunkCounter += 1
             if isRecording {
-                recordNextChunk()
+                sendEvent(withName: "onChunkReady", body: payload)
+                chunkCounter += 1
+                // Don't start the next chunk while interrupted; the .ended handler
+                // re-activates the session and restarts the loop.
+                if !wasInterrupted {
+                    recordNextChunk()
+                }
+            } else {
+                emitLastChunk(payload)
+                chunkCounter += 1
             }
         } catch {
             sendEvent(withName: "onDebug", body: "Failed to read chunk file: \(error)")
+            if !isRecording {
+                // Couldn't read the final chunk file, but Stop was requested — don't leave
+                // JS hanging in "Processing".
+                emitLastChunk([
+                    "audioData": "",
+                    "format": "m4a",
+                    "chunkNumber": chunkCounter,
+                    "empty": true
+                ])
+            }
         }
     }
 }

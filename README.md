@@ -24,7 +24,7 @@ yarn add react-native-audio-chunking
 
 ### 2. iOS Setup
 
-For iOS, the module uses CocoaPods. Run:
+For iOS only (Do not run for Expo managed React Native app), the module uses CocoaPods. Run:
 
 ```bash
 cd ios && pod install
@@ -45,25 +45,25 @@ For Android, the module is automatically linked. Make sure your app has the nece
 ### Basic Usage
 
 ```javascript
-import { NativeEventEmitter } from 'react-native';
-import AudioChunkingModule from 'react-native-audio-chunking';
+import { NativeEventEmitter } from "react-native";
+import AudioChunkingModule from "react-native-audio-chunking";
 
 // Create event emitter
 const eventEmitter = new NativeEventEmitter(AudioChunkingModule);
 
 // Setup event listeners
-eventEmitter.addListener('onChunkReady', (chunk) => {
-  console.log('Chunk ready:', chunk);
+eventEmitter.addListener("onChunkReady", (chunk) => {
+  console.log("Chunk ready:", chunk);
   // Process the chunk (e.g., send to server, save to file)
 });
 
-eventEmitter.addListener('onLastChunkReady', (chunk) => {
-  console.log('Final chunk ready:', chunk);
+eventEmitter.addListener("onLastChunkReady", (chunk) => {
+  console.log("Final chunk ready:", chunk);
   // Process the final chunk
 });
 
-eventEmitter.addListener('onDebug', (message) => {
-  console.log('Debug:', message);
+eventEmitter.addListener("onDebug", (message) => {
+  console.log("Debug:", message);
 });
 
 // Start recording
@@ -88,6 +88,7 @@ Starts recording audio with automatic chunking. Each chunk will be 120 seconds l
 **Returns:** Promise that resolves when recording starts successfully.
 
 **Throws:**
+
 - `PERMISSION_DENIED` - If microphone permission is not granted
 - `AUDIO_SETUP_FAILED` - If audio setup fails
 
@@ -98,6 +99,7 @@ Stops recording and finalizes the last chunk.
 **Returns:** Promise that resolves when recording stops successfully.
 
 **Throws:**
+
 - `AUDIO_TEARDOWN_FAILED` - If audio teardown fails
 
 ### Events
@@ -107,6 +109,7 @@ Stops recording and finalizes the last chunk.
 Emitted when a chunk is completed (except the last one).
 
 **Payload:**
+
 ```javascript
 {
   audioData: string,      // Base64 encoded audio data
@@ -133,11 +136,13 @@ Emitted for debugging information.
 ## Platform Differences
 
 ### iOS
+
 - Uses `AVAudioRecorder` for recording
 - Audio session management handled automatically
 - Temporary files stored in app's temporary directory
 
 ### Android
+
 - Uses `MediaRecorder` for recording
 - Permission checking handled automatically
 - Temporary files stored in app's cache directory
@@ -146,6 +151,7 @@ Emitted for debugging information.
 ## Audio Format
 
 Both platforms record audio in the following format:
+
 - **Container:** MPEG-4 (M4A)
 - **Codec:** AAC
 - **Sample Rate:** 44,100 Hz
@@ -156,9 +162,11 @@ Both platforms record audio in the following format:
 ## Permissions
 
 ### iOS
+
 The module automatically requests microphone permission when `startChunkedRecording()` is called.
 
 ### Android
+
 Add the following permissions to your `AndroidManifest.xml`:
 
 ```xml
@@ -175,9 +183,9 @@ Always wrap the module calls in try-catch blocks:
 try {
   await AudioChunkingModule.startChunkedRecording();
 } catch (error) {
-  if (error.code === 'PERMISSION_DENIED') {
+  if (error.code === "PERMISSION_DENIED") {
     // Handle permission denied
-  } else if (error.code === 'AUDIO_SETUP_FAILED') {
+  } else if (error.code === "AUDIO_SETUP_FAILED") {
     // Handle audio setup failure
   }
 }
@@ -205,9 +213,56 @@ try {
 Listen to the `onDebug` event to get detailed information about what's happening:
 
 ```javascript
-eventEmitter.addListener('onDebug', (message) => {
-  console.log('Debug:', message);
+eventEmitter.addListener("onDebug", (message) => {
+  console.log("Debug:", message);
 });
+```
+
+## Publishing
+
+This package is published to the public npm registry (`registry.npmjs.org`) under the npm user `izakg11`.
+
+### 1. Bump the version
+
+Update the `version` field in `package.json` (npm refuses to republish an existing version). Use [semver](https://semver.org/):
+
+```bash
+npm version patch   # bug fix: 1.0.61 -> 1.0.62
+npm version minor   # new feature: 1.0.61 -> 1.1.0
+npm version major   # breaking change: 1.0.61 -> 2.0.0
+```
+
+`npm version` also creates a git commit and tag for the new version.
+
+### 2. Log in as the package owner
+
+```bash
+npm login        # authenticate as izakg11 (NOT a different npm account)
+npm whoami       # should print: izakg11
+```
+
+### 3. Verify what will be shipped
+
+```bash
+npm pack --dry-run
+```
+
+This lists the exact files that will be included in the tarball — confirm the native sources (`ios/AudioChunkingModule.swift`, the Android `.kt` files) and the bumped version are present.
+
+### 4. Publish
+
+```bash
+npm publish
+```
+
+This is a public, unscoped package, so you do **not** need `--access public`. If the account has 2FA enabled, add the one-time code with `npm publish --otp=123456`.
+
+### 5. Consume the new version
+
+In the app that depends on this module:
+
+```bash
+npm install react-native-audio-chunking@latest
 ```
 
 ## Contributing
@@ -220,4 +275,4 @@ eventEmitter.addListener('onDebug', (message) => {
 
 ## License
 
-ISC License - see LICENSE file for details. 
+ISC License - see LICENSE file for details.

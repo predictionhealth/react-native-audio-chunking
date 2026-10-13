@@ -1,0 +1,3 @@
+# Generate a PR description (documented changes + testing instructions) and
+# create/update the GitHub PR. Never blocks the push — see scripts/generate-pr.sh.
+sh "$(git rev-parse --show-toplevel)/scripts/generate-pr.sh"
