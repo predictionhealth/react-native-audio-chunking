@@ -398,7 +398,8 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         putBoolean("empty", true)
     }
 
-    private fun recordNextChunk() = synchronized(chunkLock) {
+    private fun recordNextChunk() {
+        synchronized(chunkLock) {
         if (!isRecording || wasInterrupted) return@synchronized
 
         val fileName = "chunk_${chunkCounter}.m4a"
@@ -477,6 +478,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
                 }
             }
         }, CHUNK_DURATION_MS)
+        }
     }
 
     private fun runRecordingLoop(ar: AudioRecord, codec: MediaCodec, muxer: MediaMuxer) {
@@ -547,7 +549,8 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun finishCurrentChunk(isLast: Boolean) = synchronized(chunkLock) {
+    private fun finishCurrentChunk(isLast: Boolean) {
+        synchronized(chunkLock) {
         chunkTimer?.cancel()
         chunkTimer = null
 
@@ -584,6 +587,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         // still signal completion so JS doesn't hang in "Processing".
         if (isLast && !emitted) {
             emitLastChunk(emptyLastChunkPayload())
+        }
         }
     }
 
