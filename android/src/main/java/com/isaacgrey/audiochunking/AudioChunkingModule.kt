@@ -6,8 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
+import android.media.AudioFocusRequest
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -53,6 +56,25 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     private var scoReceiver: BroadcastReceiver? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Interruption state (e.g. incoming phone call, signalled on Android via audio
+    // focus loss). When interrupted we flush the in-progress chunk and suspend the
+    // loop, then resume on focus gain rather than letting it die or record silence.
+    @Volatile private var wasInterrupted = false
+    // Guards against emitting onLastChunkReady more than once so JS never double-transcribes.
+    @Volatile private var lastChunkEmitted = false
+    // Serializes chunk transitions across the native-modules thread, the chunk Timer
+    // thread, and the audio-focus handler thread so they can't tear down / spin up the
+    // recorder concurrently.
+    private val chunkLock = Any()
+    private var audioFocusRequest: AudioFocusRequest? = null
+    // Focus callbacks run here (not the UI thread) because handling one can join the
+    // recording thread for up to 5s, which would risk an ANR on the main thread.
+    private val focusHandlerThread = HandlerThread("audio-chunking-focus").also { it.start() }
+    private val focusHandler = Handler(focusHandlerThread.looper)
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        focusHandler.post { handleAudioFocusChange(focusChange) }
+    }
+
     private val audioDeviceCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -89,6 +111,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         }
         if (isRecording) {
             isRecording = false
+            wasInterrupted = false
             chunkTimer?.cancel()
             chunkTimer = null
             stopChunkRequested = true
@@ -98,6 +121,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             releaseRecordingResources()
             stopBluetoothScoIfStarted()
             unregisterScoReceiver()
+            abandonAudioFocus()
         }
     }
 
@@ -164,6 +188,9 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         try {
             isRecording = true
             chunkCounter = 0
+            wasInterrupted = false
+            lastChunkEmitted = false
+            requestAudioFocus()
 
             val isBtScoDevice = selectedDeviceId?.let { id ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -187,6 +214,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             }
         } catch (e: Exception) {
             isRecording = false
+            abandonAudioFocus()
             promise.reject("AUDIO_SETUP_FAILED", e.message, e)
         }
     }
@@ -198,11 +226,22 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             return
         }
         try {
-            isRecording = false
-            chunkTimer?.cancel()
-            chunkTimer = null
-            finishCurrentChunk(isLast = true)
+            synchronized(chunkLock) {
+                isRecording = false
+                chunkTimer?.cancel()
+                chunkTimer = null
+                if (wasInterrupted) {
+                    // The recorder was already torn down by an interruption, so there's no
+                    // live chunk to flush. Signal completion directly so JS doesn't hang in
+                    // "Processing" forever.
+                    wasInterrupted = false
+                    emitLastChunk(emptyLastChunkPayload())
+                } else {
+                    finishCurrentChunk(isLast = true)
+                }
+            }
             stopBluetoothScoIfStarted()
+            abandonAudioFocus()
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("AUDIO_TEARDOWN_FAILED", e.message, e)
@@ -281,8 +320,86 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun recordNextChunk() {
-        if (!isRecording) return
+    // MARK: - Interruption handling (audio focus)
+
+    private fun requestAudioFocus() {
+        val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attributes)
+                .setOnAudioFocusChangeListener(audioFocusListener, focusHandler)
+                .build()
+            audioFocusRequest = request
+            val result = audioManager.requestAudioFocus(request)
+            sendDebugEvent("requestAudioFocus result=$result")
+        } else {
+            @Suppress("DEPRECATION")
+            val result = audioManager.requestAudioFocus(
+                audioFocusListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+            sendDebugEvent("requestAudioFocus(legacy) result=$result")
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(audioFocusListener)
+        }
+    }
+
+    private fun handleAudioFocusChange(focusChange: Int) {
+        sendDebugEvent("[Interruption] focusChange=$focusChange isRecording=$isRecording wasInterrupted=$wasInterrupted")
+        when (focusChange) {
+            // A phone call (or other higher-priority capture) takes the mic. Flush the
+            // audio captured so far as a chunk and suspend the loop; AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+            // is intentionally ignored (that's ducking, not an interruption).
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> synchronized(chunkLock) {
+                if (isRecording && !wasInterrupted) {
+                    wasInterrupted = true
+                    chunkTimer?.cancel()
+                    chunkTimer = null
+                    finishCurrentChunk(isLast = false)
+                }
+            }
+            // The call ended and we have focus again: restart the chunk loop so recording
+            // continues and the terminal onLastChunkReady will still fire on stop.
+            AudioManager.AUDIOFOCUS_GAIN -> synchronized(chunkLock) {
+                if (isRecording && wasInterrupted) {
+                    wasInterrupted = false
+                    recordNextChunk()
+                    sendDebugEvent("[Interruption] resumed recording")
+                }
+            }
+        }
+    }
+
+    private fun emitLastChunk(payload: WritableMap) {
+        if (lastChunkEmitted) return
+        lastChunkEmitted = true
+        sendEvent("onLastChunkReady", payload)
+    }
+
+    private fun emptyLastChunkPayload(): WritableMap = Arguments.createMap().apply {
+        putString("audioData", "")
+        putString("format", "m4a")
+        putInt("chunkNumber", chunkCounter)
+        putBoolean("empty", true)
+    }
+
+    private fun recordNextChunk() = synchronized(chunkLock) {
+        if (!isRecording || wasInterrupted) return@synchronized
 
         val fileName = "chunk_${chunkCounter}.m4a"
         currentChunkFile = File(reactApplicationContext.cacheDir, fileName).also {
@@ -324,7 +441,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             ar.release()
             sendDebugEvent("AudioRecord failed to initialize")
             isRecording = false
-            return
+            return@synchronized
         }
 
         val codecFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SAMPLE_RATE, 1).apply {
@@ -352,9 +469,11 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         chunkTimer = Timer()
         chunkTimer?.schedule(object : TimerTask() {
             override fun run() {
-                if (isRecording) {
-                    finishCurrentChunk(isLast = false)
-                    recordNextChunk()
+                synchronized(chunkLock) {
+                    if (isRecording && !wasInterrupted) {
+                        finishCurrentChunk(isLast = false)
+                        recordNextChunk()
+                    }
                 }
             }
         }, CHUNK_DURATION_MS)
@@ -428,7 +547,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun finishCurrentChunk(isLast: Boolean) {
+    private fun finishCurrentChunk(isLast: Boolean) = synchronized(chunkLock) {
         chunkTimer?.cancel()
         chunkTimer = null
 
@@ -439,6 +558,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
 
         releaseRecordingResources()
 
+        var emitted = false
         currentChunkFile?.let { file ->
             if (file.exists() && file.length() > 0) {
                 try {
@@ -451,12 +571,19 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
                         putInt("bitsPerSample", 16)
                         putInt("chunkNumber", chunkCounter)
                     }
-                    sendEvent(if (isLast) "onLastChunkReady" else "onChunkReady", payload)
+                    if (isLast) emitLastChunk(payload) else sendEvent("onChunkReady", payload)
                     chunkCounter++
+                    emitted = true
                 } catch (e: Exception) {
                     sendDebugEvent("Failed to read chunk: ${e.message}")
                 }
             }
+        }
+
+        // If this was the final chunk but it had no audio (or failed to read),
+        // still signal completion so JS doesn't hang in "Processing".
+        if (isLast && !emitted) {
+            emitLastChunk(emptyLastChunkPayload())
         }
     }
 
