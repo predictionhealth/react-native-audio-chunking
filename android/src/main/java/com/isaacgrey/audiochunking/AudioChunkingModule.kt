@@ -79,13 +79,13 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
                 sendDebugEvent("AudioDeviceCallback: devices added: ${addedDevices.joinToString { "${it.productName}(${audioDeviceTypeToString(it.type)})" }}")
-                val payload = Arguments.createMap().apply { putArray("inputs", buildInputsList()) }
-                sendEvent("onAudioRouteChange", payload)
+                sendRouteChangeEvent(reason = 1)
             }
             override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
                 sendDebugEvent("AudioDeviceCallback: devices removed: ${removedDevices.joinToString { "${it.productName}(${audioDeviceTypeToString(it.type)})" }}")
-                val payload = Arguments.createMap().apply { putArray("inputs", buildInputsList()) }
-                sendEvent("onAudioRouteChange", payload)
+                // reason=2 signals oldDeviceUnavailable to JS so it can fall back to built-in
+                // even when nothing takes the removed device's place.
+                sendRouteChangeEvent(reason = 2)
             }
         }
     } else null
@@ -145,6 +145,47 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         return result
     }
 
+    // The input devices Android is actually routing the mic through right now — the Android
+    // analogue of iOS's AVAudioSession.currentRoute.inputs. The built-in mic is always active
+    // by default; a wired/USB headset auto-routes when connected; a Bluetooth SCO mic is only
+    // active once we've engaged SCO (Android does NOT route the mic to a merely-paired BT
+    // device). This is what lets JS ignore an idle Bluetooth headset instead of selecting it.
+    private fun activeInputDevices(): List<AudioDeviceInfo> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return emptyList()
+        val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { device ->
+            when (device.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_MIC,
+                AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                AudioDeviceInfo.TYPE_USB_DEVICE,
+                AudioDeviceInfo.TYPE_USB_HEADSET -> true
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> bluetoothScoStarted
+                else -> false
+            }
+        }
+    }
+
+    private fun buildActiveInputsList(): WritableArray {
+        val result = Arguments.createArray()
+        for (device in activeInputDevices()) {
+            result.pushMap(Arguments.createMap().apply {
+                putString("name", device.productName.toString())
+                putString("uid", device.id.toString())
+                putString("portType", audioDeviceTypeToString(device.type))
+            })
+        }
+        return result
+    }
+
+    private fun sendRouteChangeEvent(reason: Int) {
+        val payload = Arguments.createMap().apply {
+            putArray("inputs", buildInputsList())
+            putArray("activeInputs", buildActiveInputsList())
+            putInt("reason", reason)
+        }
+        sendEvent("onAudioRouteChange", payload)
+    }
+
     private fun audioDeviceTypeToString(type: Int): String {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return "Unknown"
         return when (type) {
@@ -180,6 +221,13 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun clearPreferredInput(promise: Promise) {
+        selectedDeviceId = null
+        sendDebugEvent("clearPreferredInput: reset to default (built-in) mic")
+        promise.resolve(null)
+    }
+
+    @ReactMethod
     fun startChunkedRecording(promise: Promise) {
         if (isRecording) { promise.resolve(null); return }
         if (ActivityCompat.checkSelfPermission(reactApplicationContext, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -191,6 +239,19 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             wasInterrupted = false
             lastChunkEmitted = false
             requestAudioFocus()
+
+            // Guard against a stale preferred input (mirrors iOS): if the selected device isn't
+            // in the current active route — e.g. a Bluetooth headset that's merely paired, not
+            // actively the mic — clear it so we fall back to the built-in mic, and notify JS so
+            // its state catches up. Without this, a connected-but-unused BT device would hijack
+            // the recording and capture silence.
+            selectedDeviceId?.let { id ->
+                if (activeInputDevices().none { it.id == id }) {
+                    sendDebugEvent("[StartChunked] preferred input $id not in active route — clearing to built-in")
+                    selectedDeviceId = null
+                    sendRouteChangeEvent(reason = 2)
+                }
+            }
 
             val isBtScoDevice = selectedDeviceId?.let { id ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -249,23 +310,34 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     }
 
     private fun startBluetoothScoAndRecord(promise: Promise) {
+        connectBluetoothScoThen {
+            try {
+                if (isRecording) { recordNextChunk(); promise.resolve(null) }
+                else { isRecording = false; promise.reject("RECORDING_CANCELLED", "Cancelled before SCO connected") }
+            } catch (e: Exception) { isRecording = false; promise.reject("AUDIO_SETUP_FAILED", e.message, e) }
+        }
+    }
+
+    // Establishes the Bluetooth SCO audio link, invoking onReady once connected (or after a
+    // timeout — SCO sometimes never broadcasts CONNECTED). Used both to start recording on a
+    // BT headset and to re-establish SCO after a phone call tears it down (see resume), since
+    // AudioRecord on a disconnected SCO device otherwise captures silence.
+    private fun connectBluetoothScoThen(onReady: () -> Unit) {
         val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val promiseSettled = AtomicBoolean(false)
+        val settled = AtomicBoolean(false)
 
         fun settleOnce(block: () -> Unit) {
-            if (promiseSettled.compareAndSet(false, true)) block()
+            if (settled.compareAndSet(false, true)) block()
         }
 
         val timeoutRunnable = Runnable {
             sendDebugEvent("BT SCO connect timeout after ${BT_SCO_CONNECT_TIMEOUT_MS}ms — proceeding anyway")
             unregisterScoReceiver()
-            settleOnce {
-                try {
-                    if (isRecording) { recordNextChunk(); promise.resolve(null) }
-                    else { isRecording = false; promise.reject("RECORDING_CANCELLED", "Cancelled before SCO connected") }
-                } catch (e: Exception) { isRecording = false; promise.reject("AUDIO_SETUP_FAILED", e.message, e) }
-            }
+            settleOnce { onReady() }
         }
+
+        // Clear any stale receiver before registering a fresh one.
+        unregisterScoReceiver()
 
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -273,13 +345,10 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
                 sendDebugEvent("SCO broadcast: state=$state (DISCONNECTED=0, CONNECTED=1, CONNECTING=2)")
                 when (state) {
                     AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                        sendDebugEvent("BT SCO connected — starting AudioRecord")
+                        sendDebugEvent("BT SCO connected")
                         mainHandler.removeCallbacks(timeoutRunnable)
                         unregisterScoReceiver()
-                        settleOnce {
-                            try { recordNextChunk(); promise.resolve(null) }
-                            catch (e: Exception) { isRecording = false; promise.reject("AUDIO_SETUP_FAILED", e.message, e) }
-                        }
+                        settleOnce { onReady() }
                     }
                     AudioManager.SCO_AUDIO_STATE_DISCONNECTED ->
                         sendDebugEvent("BT SCO DISCONNECTED — waiting for CONNECTED or timeout")
@@ -298,6 +367,14 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         audioManager.isBluetoothScoOn = true
         sendDebugEvent("startBluetoothSco() called — timeout in ${BT_SCO_CONNECT_TIMEOUT_MS}ms")
         mainHandler.postDelayed(timeoutRunnable, BT_SCO_CONNECT_TIMEOUT_MS)
+    }
+
+    private fun isPreferredDeviceBtSco(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+        val id = selectedDeviceId ?: return false
+        val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val device = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == id }
+        return device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
     }
 
     private fun unregisterScoReceiver() {
@@ -378,8 +455,23 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             AudioManager.AUDIOFOCUS_GAIN -> synchronized(chunkLock) {
                 if (isRecording && wasInterrupted) {
                     wasInterrupted = false
-                    recordNextChunk()
-                    sendDebugEvent("[Interruption] resumed recording")
+                    if (isPreferredDeviceBtSco()) {
+                        // The phone call tore down our SCO link; re-establish it before
+                        // resuming, otherwise AudioRecord on the (now disconnected) SCO
+                        // device captures silence. Recording restarts in the onReady callback.
+                        sendDebugEvent("[Interruption] re-establishing Bluetooth SCO before resuming")
+                        connectBluetoothScoThen {
+                            synchronized(chunkLock) {
+                                if (isRecording) {
+                                    recordNextChunk()
+                                    sendDebugEvent("[Interruption] resumed recording (SCO reconnected)")
+                                }
+                            }
+                        }
+                    } else {
+                        recordNextChunk()
+                        sendDebugEvent("[Interruption] resumed recording")
+                    }
                 }
             }
         }
@@ -588,6 +680,10 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         if (isLast && !emitted) {
             emitLastChunk(emptyLastChunkPayload())
         }
+
+        // Drop the reference so a later finish (e.g. a stop during the SCO-reconnect
+        // window) can't re-read and re-emit this already-emitted file.
+        currentChunkFile = null
         }
     }
 
