@@ -145,24 +145,16 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         return result
     }
 
-    // The input devices Android is actually routing the mic through right now — the Android
-    // analogue of iOS's AVAudioSession.currentRoute.inputs. The built-in mic is always active
-    // by default; a wired/USB headset auto-routes when connected; a Bluetooth SCO mic is only
-    // active once we've engaged SCO (Android does NOT route the mic to a merely-paired BT
-    // device). This is what lets JS ignore an idle Bluetooth headset instead of selecting it.
+    // The input devices currently connected/available. On Android getDevices(GET_DEVICES_INPUTS)
+    // only returns devices that are actually present, so "available" is effectively the active
+    // route — the close analogue of iOS's AVAudioSession.currentRoute.inputs. Keeping any
+    // connected mic (built-in, wired, USB, or Bluetooth) selected and only falling back to
+    // built-in when a device is unplugged is what matches iOS: whatever mic the user is on
+    // stays in use (and is resumed after a phone call).
     private fun activeInputDevices(): List<AudioDeviceInfo> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return emptyList()
         val audioManager = reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { device ->
-            when (device.type) {
-                AudioDeviceInfo.TYPE_BUILTIN_MIC,
-                AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                AudioDeviceInfo.TYPE_USB_DEVICE,
-                AudioDeviceInfo.TYPE_USB_HEADSET -> true
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> bluetoothScoStarted
-                else -> false
-            }
-        }
+        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
     }
 
     private fun buildActiveInputsList(): WritableArray {
@@ -240,14 +232,13 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
             lastChunkEmitted = false
             requestAudioFocus()
 
-            // Guard against a stale preferred input (mirrors iOS): if the selected device isn't
-            // in the current active route — e.g. a Bluetooth headset that's merely paired, not
-            // actively the mic — clear it so we fall back to the built-in mic, and notify JS so
-            // its state catches up. Without this, a connected-but-unused BT device would hijack
-            // the recording and capture silence.
+            // Guard against a stale preferred input (mirrors iOS): if the selected device is no
+            // longer connected — e.g. a headset unplugged between selection and record — clear
+            // it so we fall back to the built-in mic, and notify JS so its state catches up. A
+            // still-connected device (wired, USB, or Bluetooth) is kept and used.
             selectedDeviceId?.let { id ->
                 if (activeInputDevices().none { it.id == id }) {
-                    sendDebugEvent("[StartChunked] preferred input $id not in active route — clearing to built-in")
+                    sendDebugEvent("[StartChunked] preferred input $id no longer connected — clearing to built-in")
                     selectedDeviceId = null
                     sendRouteChangeEvent(reason = 2)
                 }
