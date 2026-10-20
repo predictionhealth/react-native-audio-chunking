@@ -52,6 +52,11 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     @Volatile private var stopChunkRequested = false
     private var chunkCounter = 0
     private var selectedDeviceId: Int? = null
+    // The selected mic the current chunk's AudioRecord was built for (null = default mic).
+    // A new selection only reaches the next AudioRecord, so without switching mid-chunk a
+    // Bluetooth mic picked mid-session is used at the next chunk boundary with no SCO link
+    // opened, and records silence.
+    private var recordingDeviceId: Int? = null
     private var bluetoothScoStarted = false
     private var scoReceiver: BroadcastReceiver? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -210,6 +215,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         selectedDeviceId = deviceId
         sendDebugEvent("setPreferredInput: id=$deviceId name=${device.productName} type=${audioDeviceTypeToString(device.type)}")
         promise.resolve(null)
+        switchInputIfRecording()
     }
 
     @ReactMethod
@@ -217,6 +223,40 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         selectedDeviceId = null
         sendDebugEvent("clearPreferredInput: reset to default (built-in) mic")
         promise.resolve(null)
+        switchInputIfRecording()
+    }
+
+    // Mirrors the iOS route-change roll: when the selected mic changes mid-recording (JS
+    // selects a Bluetooth headset as it connects, or clears it as it disconnects), end the
+    // current chunk now and start the next one on the new mic, opening the SCO link first
+    // for a Bluetooth mic.
+    private fun switchInputIfRecording() {
+        synchronized(chunkLock) {
+            // No live AudioRecord means a start, SCO connect, or interruption is pending;
+            // the recorder it starts reads the latest selectedDeviceId.
+            if (!isRecording || wasInterrupted || audioRecord == null) return
+            if (selectedDeviceId == recordingDeviceId) return
+            sendDebugEvent("[RouteChange] input changed $recordingDeviceId -> $selectedDeviceId, rolling chunk=$chunkCounter")
+            finishCurrentChunk(isLast = false)
+            if (isPreferredDeviceBtSco()) {
+                connectBluetoothScoThen { startChunkAfterSwitch() }
+            } else {
+                // Leaving a Bluetooth mic: drop its SCO link so the default mic is used.
+                stopBluetoothScoIfStarted()
+                startChunkAfterSwitch()
+            }
+        }
+    }
+
+    // Runs after the promise has resolved (or on main, for SCO), so an exception here has
+    // no caller to reject and would crash the app. isRecording stays true, so a later stop
+    // still emits onLastChunkReady and JS never hangs in "Processing".
+    private fun startChunkAfterSwitch() {
+        try {
+            recordNextChunk()
+        } catch (e: Exception) {
+            sendDebugEvent("[RouteChange] failed to start chunk on new input: ${e.message}")
+        }
     }
 
     @ReactMethod
@@ -484,6 +524,9 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     private fun recordNextChunk() {
         synchronized(chunkLock) {
         if (!isRecording || wasInterrupted) return@synchronized
+        // Several deferred starts (SCO connect callbacks and their timeouts) can land here;
+        // only the first may start a recorder, or two would capture into separate chunks.
+        if (audioRecord != null && recordingThread?.isAlive == true) return@synchronized
 
         val fileName = "chunk_${chunkCounter}.m4a"
         currentChunkFile = File(reactApplicationContext.cacheDir, fileName).also {
@@ -541,6 +584,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         val muxer = MediaMuxer(currentChunkFile!!.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
         audioRecord = ar
+        recordingDeviceId = selectedDeviceId
         mediaCodec = codec
         mediaMuxer = muxer
         muxerTrackIndex = -1
@@ -550,11 +594,15 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         sendDebugEvent("recordNextChunk: AudioRecord started, recordingState=${ar.recordingState} (RECORDING=3) chunk=$chunkCounter")
         recordingThread = Thread { runRecordingLoop(ar, codec, muxer) }.also { it.start() }
 
-        chunkTimer = Timer()
-        chunkTimer?.schedule(object : TimerTask() {
+        val timer = Timer()
+        chunkTimer = timer
+        timer.schedule(object : TimerTask() {
             override fun run() {
                 synchronized(chunkLock) {
-                    if (isRecording && !wasInterrupted) {
+                    // chunkTimer === timer: a task already waiting on chunkLock when another
+                    // path finished this chunk (an input switch, an interruption) must not
+                    // roll the recorder that path started.
+                    if (chunkTimer === timer && isRecording && !wasInterrupted) {
                         finishCurrentChunk(isLast = false)
                         recordNextChunk()
                     }
