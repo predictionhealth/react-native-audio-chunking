@@ -117,9 +117,17 @@ Emitted when a chunk is completed (except the last one).
   sampleRate: number,     // 44100
   channels: number,       // 1
   bitsPerSample: number,  // 16
-  chunkNumber: number     // Zero-based chunk index
+  chunkNumber: number,    // Zero-based chunk index
+  startedAtMs?: number    // Wall-clock epoch ms when this chunk started recording
 }
 ```
+
+A chunk can be shorter than 120 s: it ends early when the input mic changes
+(e.g. a Bluetooth headset connects or disconnects) or an interruption begins. Use
+`startedAtMs` rather than the event's arrival time to place a chunk on a timeline.
+It is omitted from empty terminal payloads (`audioData: ""`), and on iOS from the
+rare chunk whose recorder can no longer be matched to its start time; fall back
+to the arrival time when it is missing.
 
 #### `onLastChunkReady`
 

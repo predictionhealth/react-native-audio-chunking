@@ -57,6 +57,10 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
     // Bluetooth mic picked mid-session is used at the next chunk boundary with no SCO link
     // opened, and records silence.
     private var recordingDeviceId: Int? = null
+    // Wall-clock epoch ms when the current chunk's AudioRecord started (0 = none), sent as
+    // startedAtMs so JS can place a chunk on the day's timeline exactly, even when it ended
+    // early (input switch, interruption) or its event reached JS late.
+    private var chunkStartedAtMs = 0L
     private var bluetoothScoStarted = false
     private var scoReceiver: BroadcastReceiver? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -590,6 +594,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         muxerTrackIndex = -1
         stopChunkRequested = false
 
+        chunkStartedAtMs = System.currentTimeMillis()
         ar.startRecording()
         sendDebugEvent("recordNextChunk: AudioRecord started, recordingState=${ar.recordingState} (RECORDING=3) chunk=$chunkCounter")
         recordingThread = Thread { runRecordingLoop(ar, codec, muxer) }.also { it.start() }
@@ -704,6 +709,8 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
                         putInt("channels", 1)
                         putInt("bitsPerSample", 16)
                         putInt("chunkNumber", chunkCounter)
+                        // putDouble: epoch ms overflows putInt. Exact as a double up to 2^53.
+                        if (chunkStartedAtMs > 0) putDouble("startedAtMs", chunkStartedAtMs.toDouble())
                     }
                     if (isLast) emitLastChunk(payload) else sendEvent("onChunkReady", payload)
                     chunkCounter++
@@ -723,6 +730,7 @@ class AudioChunkingModule(reactContext: ReactApplicationContext) :
         // Drop the reference so a later finish (e.g. a stop during the SCO-reconnect
         // window) can't re-read and re-emit this already-emitted file.
         currentChunkFile = null
+        chunkStartedAtMs = 0L
         }
     }
 
