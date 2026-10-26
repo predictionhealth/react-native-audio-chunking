@@ -17,6 +17,15 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
     private var wasInterrupted = false
     // Guards against emitting onLastChunkReady more than once so JS never double-transcribes.
     private var lastChunkEmitted = false
+    // The input port the current recorder was created on. An AVAudioRecorder keeps the
+    // input format it started with, so when the route moves to another mic mid-chunk
+    // (e.g. a Bluetooth headset connects) it records silence until the route comes back.
+    private var recorderInputUid: String?
+    // Wall-clock epoch ms when the current recorder started, sent as startedAtMs so JS can
+    // place a chunk on the day's timeline exactly, even when it ended early (input switch,
+    // interruption) or its event reached JS late. Keyed by recorder so a late delegate call
+    // for an older recorder never reports the newer chunk's start.
+    private var chunkStart: (recorder: ObjectIdentifier, ms: Int64)?
 
     // Legacy properties (unused with recorder approach)
     private var audioEngine: AVAudioEngine?
@@ -104,6 +113,23 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
             "activeInputs": activeInputs,
             "reason": reasonValue
         ])
+        DispatchQueue.main.async { self.rollChunkIfInputChanged() }
+    }
+
+    // When the active input is no longer the one the recorder was created on, end the
+    // chunk early. The delegate emits it as a normal onChunkReady and starts the next
+    // chunk, which picks up the new route. Covers both directions: switching onto a
+    // Bluetooth mic and falling back to built-in when it disconnects.
+    private func rollChunkIfInputChanged() {
+        guard isRecording, !wasInterrupted, let recorder = recorder else { return }
+        // An empty route is a transient mid-switch state; the next route change carries
+        // the new input.
+        guard let currentUid = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid,
+              currentUid != recorderInputUid else { return }
+        sendEvent(withName: "onDebug", body: "[RouteChange] input changed \(recorderInputUid ?? "nil") -> \(currentUid), rolling chunk=\(chunkCounter)")
+        // Set before stopping so a burst of route notifications rolls the chunk only once.
+        recorderInputUid = currentUid
+        recorder.stop()
     }
 
     @objc private func audioInterruption(_ notification: Notification) {
@@ -296,9 +322,19 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
         ]
 
         do {
-            recorder = try AVAudioRecorder(url: fileURL, settings: settings)
-            recorder?.delegate = self
-            recorder?.record(forDuration: TimeInterval(chunkDurationMs) / 1000.0)
+            let newRecorder = try AVAudioRecorder(url: fileURL, settings: settings)
+            recorder = newRecorder
+            newRecorder.delegate = self
+            chunkStart = (ObjectIdentifier(newRecorder), Int64(Date().timeIntervalSince1970 * 1000))
+            newRecorder.record(forDuration: TimeInterval(chunkDurationMs) / 1000.0)
+            recorderInputUid = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
+            // stopRecording runs on another queue. If it landed after the delegate decided to
+            // start this chunk, it stopped the previous (finished) recorder, so stop this one
+            // now; the delegate then emits it as the last chunk instead of recording on for a
+            // full chunk after the user pressed stop.
+            if !isRecording {
+                recorder?.stop()
+            }
         } catch {
             sendEvent(withName: "onDebug", body: "Recorder failed to start: \(error)")
             isRecording = false
@@ -328,7 +364,7 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
         do {
             let data = try Data(contentsOf: recorder.url)
             let base64String = data.base64EncodedString()
-            let payload: [String: Any] = [
+            var payload: [String: Any] = [
                 "audioData": base64String,
                 "format": "m4a",
                 "sampleRate": Int(sampleRate),
@@ -336,6 +372,9 @@ class AudioChunkingModule: RCTEventEmitter, AVAudioRecorderDelegate {
                 "bitsPerSample": 16,
                 "chunkNumber": chunkCounter
             ]
+            if let start = chunkStart, start.recorder == ObjectIdentifier(recorder) {
+                payload["startedAtMs"] = start.ms
+            }
             if isRecording {
                 sendEvent(withName: "onChunkReady", body: payload)
                 chunkCounter += 1
